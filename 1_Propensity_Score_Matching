@@ -1,21 +1,32 @@
 /* ============================================================
-   FAIR LENDING PSM ANALYSIS - MULTI-GROUP - FINAL
+   FAIR LENDING PSM ANALYSIS - MULTI-GROUP, MULTI-OUTCOME
    HMDA 2024 | Credit Union | White as Baseline
-   Groups: Black, Hispanic, Asian
+   Groups:   Black, Hispanic, Asian
+   Outcomes: Rate, Points, Credits, Cost%, All-In Cost
+   Methods:  GLM (matched) + IPW Doubly-Robust
    ============================================================ */
 
 %let path = S:\Projects\OCFP_Fair_Lending\2024_NEW\data;
 libname hmda24 "&path";
 
 /* ============================================================
-   STEP 1: CREATE DATASET WITH KEEP FLAGS
+   STEP 1: CREATE DATASET WITH KEEP FLAGS + COMPOSITE COST
    ============================================================ */
 
 data hmda_race;
   set hmda24.eslfcu;
+
+  /* Keep flags for each comparison */
   keep_bw = (black=1 or white=1);
   keep_hw = (hisp=1  or white=1);
   keep_aw = (asian=1 or white=1);
+
+  /* Composite "all-in cost" - sum of all pricing components
+     Adjust formula to your CU's pricing convention if needed */
+  all_in_cost = (numeric_rate / 100)        /* rate as decimal */
+              + Discount_Points_LA           /* points paid     */
+              - Lender_Credits_LA            /* credits given   */
+              + Loan_Cost_Prc_LA;            /* total cost %    */
 run;
 
 proc freq data=hmda_race;
@@ -24,8 +35,14 @@ proc freq data=hmda_race;
   title "Sample Counts by Race Group";
 run;
 
+proc means data=hmda_race n mean stddev min max;
+  var numeric_rate Discount_Points_LA Lender_Credits_LA
+      Loan_Cost_Prc_LA all_in_cost;
+  title "Pricing Variables - Distribution Check";
+run;
+
 /* ============================================================
-   STEP 2: PSM MACRO WITH PROPER RESULT CAPTURE
+   STEP 2: PSM MACRO WITH MULTI-OUTCOME ANALYSIS
    ============================================================ */
 
 %macro fair_lending_psm(
@@ -37,7 +54,7 @@ run;
   title "=== FAIR LENDING: &label vs. White ===";
 
   /* ----------------------------------------------------------
-     2A: SUBSET
+     2A: SUBSET TO COMPARISON PAIR
      ---------------------------------------------------------- */
   data analysis_&group;
     set hmda_race;
@@ -74,7 +91,7 @@ run;
   ods graphics off;
 
   /* ----------------------------------------------------------
-     2C: PSM MATCHING
+     2C: PSM MATCHING - 1:1 Optimal, caliper 0.25
      ---------------------------------------------------------- */
   ods graphics on;
 
@@ -104,58 +121,28 @@ run;
 
   ods graphics off;
 
+  /* Re-add composite to matched data (PSMATCH may drop it) */
+  data matched_&group;
+    set matched_&group;
+    if missing(all_in_cost) then
+      all_in_cost = (numeric_rate / 100)
+                  + Discount_Points_LA
+                  - Lender_Credits_LA
+                  + Loan_Cost_Prc_LA;
+  run;
+
   /* ----------------------------------------------------------
      2D: BALANCE
      ---------------------------------------------------------- */
   proc means data=matched_&group mean stddev;
     class treated;
     var Discount_Points_LA Lender_Credits_LA
-        Loan_Cost_Prc_LA numeric_rate pscore;
+        Loan_Cost_Prc_LA numeric_rate all_in_cost pscore;
     title "Post-Match Balance | &label vs White";
   run;
 
   /* ----------------------------------------------------------
-     2E: T-TEST for unadjusted comparison
-     Capture the ttests output table
-     ---------------------------------------------------------- */
-  ods output Statistics = ttest_stats_&group
-             TTests     = ttest_pvals_&group;
-
-  proc ttest data=matched_&group;
-    weight loan_amt;
-    class treated;
-    var numeric_rate;
-    title "T-Test | &label vs White | numeric_rate";
-  run;
-
-  /* ----------------------------------------------------------
-     2F: ADJUSTED GLM
-     Capture parameter estimates directly - more reliable
-     than LSMeans table
-     ---------------------------------------------------------- */
-  ods output ParameterEstimates = glm_parms_&group;
-
-  proc glm data=matched_&group;
-    class treated
-      LTV_2a--LTV_6a CS_1a--CS_5a
-      Broker Other_Lien Offers_Other_Types
-      Lender_0_500--Lender_5000_10000
-      M1-M11;
-    model numeric_rate =
-      treated
-      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
-      LTV_2a--LTV_6a CS_1a--CS_5a
-      Broker Other_Lien Offers_Other_Types
-      Lender_0_500--Lender_5000_10000
-      M1-M11
-      / solution clparm;
-    title "Adjusted GLM | &label vs White | numeric_rate";
-  run;
-  quit;
-
-  /* ----------------------------------------------------------
-     2G: DOUBLY-ROBUST IPW
-     Capture parameter estimates from GENMOD
+     2E: BUILD IPW DATASET
      ---------------------------------------------------------- */
   proc sql noprint;
     select count(*) into :n_treated trimmed
@@ -170,69 +157,109 @@ run;
       then sipw = (&n_treated/&n_total) / pscore;
     else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
     if sipw > 10 then sipw = 10;
-  run;
-
-  ods output ParameterEstimates = ipw_parms_&group;
-
-  proc genmod data=ps_ipw_&group;
-    class treated M1-M11
-          LTV_2a--LTV_6a CS_1a--CS_5a;
-    model numeric_rate =
-      treated
-      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
-      LTV_2a--LTV_6a CS_1a--CS_5a
-      M1-M11
-      / dist=normal link=identity;
-    weight sipw;
-    title "Doubly-Robust IPW | &label vs White | Rate";
+    /* Add composite if missing */
+    if missing(all_in_cost) then
+      all_in_cost = (numeric_rate / 100)
+                  + Discount_Points_LA
+                  - Lender_Credits_LA
+                  + Loan_Cost_Prc_LA;
   run;
 
   /* ----------------------------------------------------------
-     2H: BUILD CLEAN RESULT ROWS FOR THIS GROUP
+     2F: LOOP OVER ALL FIVE PRICING OUTCOMES
      ---------------------------------------------------------- */
+  %let outcomes = numeric_rate Discount_Points_LA
+                  Lender_Credits_LA Loan_Cost_Prc_LA
+                  all_in_cost;
+  %let i = 1;
 
-  /* GLM result - extract treated coefficient */
-  data glm_result_&group;
-    set glm_parms_&group;
-    where Parameter contains 'treated' and Parameter ne '';
-    length group $12 method $15;
-    group  = "&label";
-    method = "GLM_Adjusted";
-    /* GLM with class variable: coefficient is for level 0
-       so flip sign to get (treated - control) */
-    rate_diff = -1 * Estimate;
-    std_err   = StdErr;
-    pvalue    = Probt;
-    lower_cl  = -1 * UpperCL;
-    upper_cl  = -1 * LowerCL;
-    keep group method rate_diff std_err pvalue lower_cl upper_cl;
-  run;
+  %do %while (%scan(&outcomes, &i) ne );
+    %let var = %scan(&outcomes, &i);
 
-  /* IPW result - extract treated coefficient */
-  data ipw_result_&group;
-    set ipw_parms_&group;
-    where Parameter contains 'treated' and Level1 = '1';
-    length group $12 method $15;
-    group  = "&label";
-    method = "IPW_DR";
-    rate_diff = Estimate;
-    std_err   = StdErr;
-    pvalue    = ProbChiSq;
-    lower_cl  = LowerWaldCL;
-    upper_cl  = UpperWaldCL;
-    keep group method rate_diff std_err pvalue lower_cl upper_cl;
-  run;
+    /* ---- GLM (matched, fully adjusted) ---- */
+    ods output ParameterEstimates = glm_parms_&group._&i;
 
-  /* T-test result */
-  data ttest_result_&group;
-    set ttest_pvals_&group;
-    where Method = 'Pooled';
-    length group $12 method $15;
-    group  = "&label";
-    method = "Unadjusted_t";
-    /* Probt from ttest is two-sided */
-    pvalue = Probt;
-    keep group method pvalue;
+    proc glm data=matched_&group;
+      class treated
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        Broker Other_Lien Offers_Other_Types
+        Lender_0_500--Lender_5000_10000
+        M1-M11;
+      model &var =
+        treated
+        Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        Broker Other_Lien Offers_Other_Types
+        Lender_0_500--Lender_5000_10000
+        M1-M11
+        / solution clparm;
+      title "Adjusted GLM | &label vs White | &var";
+    run;
+    quit;
+
+    data glm_result_&group._&i;
+      set glm_parms_&group._&i;
+      where Parameter contains 'treated' and Parameter ne '';
+      length group $12 method $15 outcome $25;
+      group   = "&label";
+      method  = "GLM_Adjusted";
+      outcome = "&var";
+      /* GLM with class treated codes 0 first;
+         flip sign so positive = minority higher */
+      rate_diff = -1 * Estimate;
+      std_err   = StdErr;
+      pvalue    = Probt;
+      lower_cl  = -1 * UpperCL;
+      upper_cl  = -1 * LowerCL;
+      keep group method outcome rate_diff std_err
+           pvalue lower_cl upper_cl;
+    run;
+
+    /* ---- IPW Doubly-Robust ---- */
+    ods output ParameterEstimates = ipw_parms_&group._&i;
+
+    proc genmod data=ps_ipw_&group;
+      class treated M1-M11
+            LTV_2a--LTV_6a CS_1a--CS_5a;
+      model &var =
+        treated
+        Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        M1-M11
+        / dist=normal link=identity;
+      weight sipw;
+      title "IPW Doubly-Robust | &label vs White | &var";
+    run;
+
+    data ipw_result_&group._&i;
+      set ipw_parms_&group._&i;
+      where Parameter contains 'treated' and Level1 = '1';
+      length group $12 method $15 outcome $25;
+      group   = "&label";
+      method  = "IPW_DR";
+      outcome = "&var";
+      rate_diff = Estimate;
+      std_err   = StdErr;
+      pvalue    = ProbChiSq;
+      lower_cl  = LowerWaldCL;
+      upper_cl  = UpperWaldCL;
+      keep group method outcome rate_diff std_err
+           pvalue lower_cl upper_cl;
+    run;
+
+    %let i = %eval(&i + 1);
+  %end;
+
+  /* ----------------------------------------------------------
+     2G: COMBINE ALL RESULTS FOR THIS GROUP
+     ---------------------------------------------------------- */
+  data results_&group;
+    set glm_result_&group._1 glm_result_&group._2
+        glm_result_&group._3 glm_result_&group._4
+        glm_result_&group._5
+        ipw_result_&group._1 ipw_result_&group._2
+        ipw_result_&group._3 ipw_result_&group._4
+        ipw_result_&group._5;
   run;
 
 %mend fair_lending_psm;
@@ -246,67 +273,144 @@ run;
 %fair_lending_psm(group=asian, label=Asian,    keepvar=keep_aw);
 
 /* ============================================================
-   STEP 4: COMBINED SUMMARY - GLM + IPW
+   STEP 4: BUILD COMBINED SUMMARY WITH DIRECTIONAL FLAGS
    ============================================================ */
 
-data summary_glm;
-  set glm_result_black
-      glm_result_hisp
-      glm_result_asian;
-run;
-
-data summary_ipw;
-  set ipw_result_black
-      ipw_result_hisp
-      ipw_result_asian;
-run;
-
 data summary_all;
-  set summary_glm summary_ipw;
-  length finding $30;
-  if pvalue ne . and pvalue < 0.05 and rate_diff > 0
-    then finding = "*** ADVERSE - SIGNIFICANT";
-  else if pvalue ne . and pvalue < 0.10 and rate_diff > 0
-    then finding = "** ADVERSE - MARGINAL";
-  else if pvalue ne . and pvalue < 0.05 and rate_diff < 0
-    then finding = "Favorable - significant";
-  else if rate_diff ne . and rate_diff < 0
-    then finding = "Favorable - not significant";
-  else if rate_diff ne . and rate_diff >= 0
-    then finding = "No significant disparity";
-  else finding = "Result unavailable";
+  set results_black results_hisp results_asian;
+  length finding $30 direction_note $20;
+
+  /* Determine adverse direction by outcome:
+     - Lender_Credits: LOWER credit = adverse (got less benefit)
+     - Everything else: HIGHER value = adverse              */
+  if outcome = 'Lender_Credits_LA' then do;
+    direction_note = "Lower=Adverse";
+    if pvalue ne . and pvalue < 0.05 and rate_diff < 0
+      then finding = "*** ADVERSE - SIGNIFICANT";
+    else if pvalue ne . and pvalue < 0.10 and rate_diff < 0
+      then finding = "** ADVERSE - MARGINAL";
+    else if rate_diff ne . and rate_diff > 0
+      then finding = "Favorable to minority";
+    else finding = "No significant disparity";
+  end;
+  else do;
+    direction_note = "Higher=Adverse";
+    if pvalue ne . and pvalue < 0.05 and rate_diff > 0
+      then finding = "*** ADVERSE - SIGNIFICANT";
+    else if pvalue ne . and pvalue < 0.10 and rate_diff > 0
+      then finding = "** ADVERSE - MARGINAL";
+    else if rate_diff ne . and rate_diff < 0
+      then finding = "Favorable to minority";
+    else finding = "No significant disparity";
+  end;
 run;
 
 proc sort data=summary_all;
-  by group method;
-run;
-
-proc print data=summary_all noobs;
-  title "FAIR LENDING RATE DISPARITY SUMMARY - 2024 HMDA";
-  title2 "Both GLM (matched) and IPW (doubly-robust) Methods";
-  var group method rate_diff std_err lower_cl upper_cl pvalue finding;
-  format rate_diff std_err lower_cl upper_cl 8.4
-         pvalue 6.4;
-  label rate_diff = "Rate Diff (minority - white)"
-        std_err   = "Std Error"
-        lower_cl  = "95% Lower"
-        upper_cl  = "95% Upper"
-        pvalue    = "P-Value"
-        finding   = "Interpretation";
+  by group outcome method;
 run;
 
 /* ============================================================
-   STEP 5: EXPORT TO EXCEL
+   STEP 5: MASTER REPORT - FULL DETAIL
    ============================================================ */
 
-ods excel file="&path\Fair_Lending_Summary_2024.xlsx"
-          options(sheet_name="Rate Disparities"
-                  embedded_titles="yes");
+proc print data=summary_all noobs label;
+  title "FAIR LENDING DISPARITY SUMMARY - ALL PRICING OUTCOMES";
+  title2 "2024 HMDA | GLM + IPW Doubly-Robust";
+  by group;
+  id group;
+  var outcome method rate_diff std_err lower_cl upper_cl
+      pvalue direction_note finding;
+  format rate_diff std_err lower_cl upper_cl 10.5
+         pvalue 6.4;
+  label outcome    = "Outcome"
+        method     = "Method"
+        rate_diff  = "Diff (minority - white)"
+        std_err    = "Std Error"
+        lower_cl   = "95% Lower"
+        upper_cl   = "95% Upper"
+        pvalue     = "P-Value"
+        direction_note = "Direction"
+        finding    = "Interpretation";
+run;
 
-proc print data=summary_all noobs;
-  title "Fair Lending Rate Disparity Analysis - 2024 HMDA";
-  var group method rate_diff std_err lower_cl upper_cl pvalue finding;
-  format rate_diff std_err lower_cl upper_cl 8.4
+/* ============================================================
+   STEP 6: FLAGGED ADVERSE FINDINGS ONLY
+   ============================================================ */
+
+proc print data=summary_all noobs label;
+  where finding contains 'ADVERSE';
+  title "FLAGGED ADVERSE FINDINGS - REQUIRES REVIEW";
+  var group outcome method rate_diff std_err
+      pvalue finding;
+  format rate_diff std_err 10.5 pvalue 6.4;
+run;
+
+/* If no rows print, show explicit "no findings" message */
+data _null_;
+  set summary_all;
+  where finding contains 'ADVERSE';
+  if _n_ = 1 then put "Adverse findings detected - see above";
+run;
+
+/* ============================================================
+   STEP 7: PIVOT VIEW - SIDE-BY-SIDE METHOD COMPARISON
+   ============================================================ */
+
+proc tabulate data=summary_all format=10.5;
+  class group outcome method;
+  var rate_diff pvalue;
+  table group='Group'*outcome='Outcome',
+        method=''*(rate_diff='Disparity'*sum=''
+                   pvalue='P-Val'*sum=''*f=6.4)
+        / box='Multi-Method Comparison';
+  title "PIVOT VIEW: GLM vs IPW Side-By-Side";
+run;
+
+/* ============================================================
+   STEP 8: EXPORT FULL ANALYSIS TO EXCEL
+   ============================================================ */
+
+ods excel file="&path\Fair_Lending_Multi_Outcome_2024.xlsx"
+          options(embedded_titles="yes");
+
+/* Sheet 1: Full detail */
+ods excel options(sheet_name="Full Detail");
+proc print data=summary_all noobs label;
+  title "Fair Lending Disparity Analysis - 2024 HMDA";
+  title2 "All Outcomes, All Groups, Both Methods";
+  var group outcome method rate_diff std_err
+      lower_cl upper_cl pvalue direction_note finding;
+  format rate_diff std_err lower_cl upper_cl 10.5
+         pvalue 6.4;
+run;
+
+/* Sheet 2: Adverse only */
+ods excel options(sheet_name="Adverse Findings");
+proc print data=summary_all noobs label;
+  where finding contains 'ADVERSE';
+  title "Flagged Adverse Findings";
+  var group outcome method rate_diff std_err
+      pvalue finding;
+  format rate_diff std_err 10.5 pvalue 6.4;
+run;
+
+/* Sheet 3: GLM only */
+ods excel options(sheet_name="GLM Results");
+proc print data=summary_all noobs label;
+  where method = 'GLM_Adjusted';
+  var group outcome rate_diff std_err lower_cl
+      upper_cl pvalue finding;
+  format rate_diff std_err lower_cl upper_cl 10.5
+         pvalue 6.4;
+run;
+
+/* Sheet 4: IPW only */
+ods excel options(sheet_name="IPW Doubly-Robust");
+proc print data=summary_all noobs label;
+  where method = 'IPW_DR';
+  var group outcome rate_diff std_err lower_cl
+      upper_cl pvalue finding;
+  format rate_diff std_err lower_cl upper_cl 10.5
          pvalue 6.4;
 run;
 
