@@ -1,7 +1,7 @@
 /* ============================================================
-   FAIR LENDING ANALYSIS - CONSOLIDATED FINAL CODE V2
+   FAIR LENDING ANALYSIS - CONSOLIDATED FINAL CODE V3
    Methods: PSM + GLM + IPW + Adjusted Bootstrap
-   FIXED: IPW and Bootstrap parameter capture filters
+   FIXED: IPW sign flip + flexible parameter capture
    HMDA 2024 | Credit Union | White as Baseline
    Groups: Black, Hispanic, Asian
    ============================================================ */
@@ -28,6 +28,8 @@ data hmda_race;
   keep_hw = (hisp=1  or white=1);
   keep_aw = (asian=1 or white=1);
 
+  /* Composite all-in cost - DIY total cost proxy
+     Use APR variable instead if your data has it */
   all_in_cost = (numeric_rate / 100)
               + Discount_Points_LA
               - Lender_Credits_LA
@@ -188,10 +190,10 @@ run;
     run;
     quit;
 
-    /* GLM result - FIXED filter */
+    /* GLM result - sign flip applied */
     data glm_result_&group._&i;
       set glm_parms_&group._&i;
-      where (Parameter = 'treated' 
+      where (Parameter = 'treated'
              or Parameter contains 'treated')
         and Estimate ne 0
         and Estimate ne .;
@@ -208,7 +210,7 @@ run;
            pvalue lower_cl upper_cl;
     run;
 
-    /* IPW - using NOBOUND to avoid issues */
+    /* IPW */
     ods output ParameterEstimates = ipw_parms_&group._&i;
 
     proc genmod data=ps_ipw_&group;
@@ -224,12 +226,9 @@ run;
       title "IPW | &label vs White | &var";
     run;
 
-    /* IPW result - FIXED filter handles multiple SAS versions */
+    /* IPW result - SIGN FLIPPED to match GLM convention */
     data ipw_result_&group._&i;
       set ipw_parms_&group._&i;
-      /* Match treated parameter - works whether SAS uses
-         Parameter='treated 1', Parameter='treated' with Level1='1',
-         or any other variant */
       where (Parameter = 'treated'
              or Parameter contains 'treated')
         and Estimate ne 0
@@ -238,18 +237,20 @@ run;
       group   = "&label";
       method  = "IPW_DR";
       outcome = "&var";
-      rate_diff = Estimate;
-      /* Standard error column name varies by SAS version */
-      if not missing(StdErr)     then std_err = StdErr;
-      else if not missing(stderr) then std_err = stderr;
-      /* P-value column varies too */
-      if not missing(ProbChiSq)  then pvalue = ProbChiSq;
+      /* Sign flip - GENMOD class variable references level 0 same as GLM */
+      rate_diff = -1 * Estimate;
+      /* Standard error column varies by SAS version */
+      if not missing(StdErr) then std_err = StdErr;
+      else std_err = .;
+      /* P-value column */
+      if not missing(ProbChiSq) then pvalue = ProbChiSq;
       else if not missing(Probt) then pvalue = Probt;
-      /* CI columns vary */
-      if not missing(LowerWaldCL) then lower_cl = LowerWaldCL;
-      else if not missing(LowerCL) then lower_cl = LowerCL;
-      if not missing(UpperWaldCL) then upper_cl = UpperWaldCL;
-      else if not missing(UpperCL) then upper_cl = UpperCL;
+      else pvalue = .;
+      /* CI bounds - flipped to match sign convention */
+      if not missing(LowerWaldCL) then upper_cl = -1 * LowerWaldCL;
+      else if not missing(LowerCL) then upper_cl = -1 * LowerCL;
+      if not missing(UpperWaldCL) then lower_cl = -1 * UpperWaldCL;
+      else if not missing(UpperCL) then lower_cl = -1 * UpperCL;
       keep group method outcome rate_diff std_err
            pvalue lower_cl upper_cl;
     run;
@@ -269,7 +270,7 @@ run;
 %mend fair_lending_psm;
 
 /* ============================================================
-   STEP 3: ADJUSTED BOOTSTRAP MACRO - FIXED
+   STEP 3: ADJUSTED BOOTSTRAP MACRO
    ============================================================ */
 
 %macro bootstrap_adjusted(
@@ -326,10 +327,10 @@ run;
   ods listing;
   ods output close;
 
-  /* Extract treated coefficient - FIXED filter */
+  /* Sign flipped to match GLM/IPW convention */
   data boot_coefs_&group._&outcome;
     set boot_parms_&group._&outcome;
-    where (Parameter = 'treated' 
+    where (Parameter = 'treated'
            or Parameter contains 'treated')
       and Estimate ne 0
       and Estimate ne .;
@@ -337,25 +338,18 @@ run;
     keep Replicate adj_diff;
   run;
 
-  /* Verify we have coefficients */
   proc sql noprint;
     select count(*) into :n_coefs trimmed
     from boot_coefs_&group._&outcome;
   quit;
 
   %if &n_coefs = 0 %then %do;
-    %put WARNING: No bootstrap coefficients captured for &group &outcome;
-    /* Create empty result so combine step works */
+    %put WARNING: No bootstrap coefficients for &group &outcome;
     data boot_result_&group._&outcome;
       length group $12 method $20 outcome $25;
-      group   = "&label";
-      method  = "Adj_Bootstrap";
-      outcome = "&outcome";
-      rate_diff = .;
-      std_err = .;
-      pvalue = .;
-      lower_cl = .;
-      upper_cl = .;
+      group = "&label"; method = "Adj_Bootstrap"; outcome = "&outcome";
+      rate_diff = .; std_err = .; pvalue = .;
+      lower_cl = .; upper_cl = .;
     run;
     %return;
   %end;
@@ -400,7 +394,6 @@ run;
     from obs_coef_&group._&outcome;
   quit;
 
-  /* Bootstrap p-value */
   data boot_pval_&group._&outcome;
     set boot_coefs_&group._&outcome end=last;
     retain ge 0 tot 0;
@@ -413,7 +406,6 @@ run;
     keep boot_p;
   run;
 
-  /* Build result row */
   data boot_result_&group._&outcome;
     length group $12 method $20 outcome $25;
     if _n_ = 1 then do;
@@ -480,7 +472,7 @@ run;
 %run_all_bootstraps;
 
 /* ============================================================
-   STEP 6: COMBINE ALL RESULTS
+   STEP 6: COMBINE RESULTS
    ============================================================ */
 
 data all_bootstrap_results;
@@ -541,7 +533,7 @@ proc sort data=summary_all;
 run;
 
 /* ============================================================
-   STEP 7: RESTORE LOG AND PRINT
+   STEP 7: RESTORE LOG AND PRINT REPORTS
    ============================================================ */
 
 proc printto;
@@ -560,6 +552,7 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
+/* Method convergence */
 proc sql;
   create table convergence as
   select
@@ -655,4 +648,4 @@ run;
 
 ods excel close;
 
-%put NOTE: Analysis complete.;
+%put NOTE: Analysis complete - V3 with IPW sign fix;
