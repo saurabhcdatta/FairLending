@@ -1,5 +1,6 @@
 /* ============================================================
    FAIR LENDING PSM ANALYSIS - MULTI-GROUP, MULTI-OUTCOME
+   FIXED: Outcome variables removed from RHS controls
    HMDA 2024 | Credit Union | White as Baseline
    Groups:   Black, Hispanic, Asian
    Outcomes: Rate, Points, Credits, Cost%, All-In Cost
@@ -21,12 +22,11 @@ data hmda_race;
   keep_hw = (hisp=1  or white=1);
   keep_aw = (asian=1 or white=1);
 
-  /* Composite "all-in cost" - sum of all pricing components
-     Adjust formula to your CU's pricing convention if needed */
-  all_in_cost = (numeric_rate / 100)        /* rate as decimal */
-              + Discount_Points_LA           /* points paid     */
-              - Lender_Credits_LA            /* credits given   */
-              + Loan_Cost_Prc_LA;            /* total cost %    */
+  /* Composite "all-in cost" */
+  all_in_cost = (numeric_rate / 100)
+              + Discount_Points_LA
+              - Lender_Credits_LA
+              + Loan_Cost_Prc_LA;
 run;
 
 proc freq data=hmda_race;
@@ -121,7 +121,7 @@ run;
 
   ods graphics off;
 
-  /* Re-add composite to matched data (PSMATCH may drop it) */
+  /* Recompute composite if PSMATCH dropped it */
   data matched_&group;
     set matched_&group;
     if missing(all_in_cost) then
@@ -157,7 +157,6 @@ run;
       then sipw = (&n_treated/&n_total) / pscore;
     else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
     if sipw > 10 then sipw = 10;
-    /* Add composite if missing */
     if missing(all_in_cost) then
       all_in_cost = (numeric_rate / 100)
                   + Discount_Points_LA
@@ -166,7 +165,8 @@ run;
   run;
 
   /* ----------------------------------------------------------
-     2F: LOOP OVER ALL FIVE PRICING OUTCOMES
+     2F: LOOP OVER FIVE PRICING OUTCOMES
+     CRITICAL: Outcome variable is excluded from controls
      ---------------------------------------------------------- */
   %let outcomes = numeric_rate Discount_Points_LA
                   Lender_Credits_LA Loan_Cost_Prc_LA
@@ -175,6 +175,19 @@ run;
 
   %do %while (%scan(&outcomes, &i) ne );
     %let var = %scan(&outcomes, &i);
+
+    /* Dynamic control list - exclude the outcome from RHS */
+    %let pricing_controls =;
+    %if &var ne Discount_Points_LA %then
+      %let pricing_controls = &pricing_controls Discount_Points_LA;
+    %if &var ne Lender_Credits_LA %then
+      %let pricing_controls = &pricing_controls Lender_Credits_LA;
+    %if &var ne Loan_Cost_Prc_LA %then
+      %let pricing_controls = &pricing_controls Loan_Cost_Prc_LA;
+    /* all_in_cost contains all components - drop them all */
+    %if &var = all_in_cost %then %let pricing_controls = ;
+
+    %put NOTE: Outcome=&var | Controls=&pricing_controls;
 
     /* ---- GLM (matched, fully adjusted) ---- */
     ods output ParameterEstimates = glm_parms_&group._&i;
@@ -187,7 +200,7 @@ run;
         M1-M11;
       model &var =
         treated
-        Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+        &pricing_controls
         LTV_2a--LTV_6a CS_1a--CS_5a
         Broker Other_Lien Offers_Other_Types
         Lender_0_500--Lender_5000_10000
@@ -199,7 +212,9 @@ run;
 
     data glm_result_&group._&i;
       set glm_parms_&group._&i;
-      where Parameter contains 'treated' and Parameter ne '';
+      where Parameter contains 'treated' 
+        and Parameter ne ''
+        and Estimate ne 0;        /* Drop reference-level rows */
       length group $12 method $15 outcome $25;
       group   = "&label";
       method  = "GLM_Adjusted";
@@ -223,7 +238,7 @@ run;
             LTV_2a--LTV_6a CS_1a--CS_5a;
       model &var =
         treated
-        Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+        &pricing_controls
         LTV_2a--LTV_6a CS_1a--CS_5a
         M1-M11
         / dist=normal link=identity;
@@ -233,7 +248,8 @@ run;
 
     data ipw_result_&group._&i;
       set ipw_parms_&group._&i;
-      where Parameter contains 'treated' and Level1 = '1';
+      where Parameter contains 'treated' 
+        and Level1 = '1';
       length group $12 method $15 outcome $25;
       group   = "&label";
       method  = "IPW_DR";
@@ -251,7 +267,7 @@ run;
   %end;
 
   /* ----------------------------------------------------------
-     2G: COMBINE ALL RESULTS FOR THIS GROUP
+     2G: COMBINE RESULTS FOR THIS GROUP
      ---------------------------------------------------------- */
   data results_&group;
     set glm_result_&group._1 glm_result_&group._2
@@ -280,9 +296,8 @@ data summary_all;
   set results_black results_hisp results_asian;
   length finding $30 direction_note $20;
 
-  /* Determine adverse direction by outcome:
-     - Lender_Credits: LOWER credit = adverse (got less benefit)
-     - Everything else: HIGHER value = adverse              */
+  /* For Lender_Credits, LOWER value = adverse;
+     For everything else, HIGHER value = adverse */
   if outcome = 'Lender_Credits_LA' then do;
     direction_note = "Lower=Adverse";
     if pvalue ne . and pvalue < 0.05 and rate_diff < 0
@@ -303,6 +318,13 @@ data summary_all;
       then finding = "Favorable to minority";
     else finding = "No significant disparity";
   end;
+
+  /* Economic magnitude on $300K loan */
+  if outcome in ('Discount_Points_LA' 'Lender_Credits_LA' 
+                 'Loan_Cost_Prc_LA' 'all_in_cost')
+    then dollar_impact_300k = rate_diff * 300000;
+  else if outcome = 'numeric_rate'
+    then dollar_impact_300k = rate_diff * 300000 / 100;
 run;
 
 proc sort data=summary_all;
@@ -319,55 +341,51 @@ proc print data=summary_all noobs label;
   by group;
   id group;
   var outcome method rate_diff std_err lower_cl upper_cl
-      pvalue direction_note finding;
-  format rate_diff std_err lower_cl upper_cl 10.5
-         pvalue 6.4;
-  label outcome    = "Outcome"
-        method     = "Method"
-        rate_diff  = "Diff (minority - white)"
-        std_err    = "Std Error"
-        lower_cl   = "95% Lower"
-        upper_cl   = "95% Upper"
-        pvalue     = "P-Value"
+      pvalue dollar_impact_300k direction_note finding;
+  format rate_diff std_err lower_cl upper_cl 12.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+  label outcome = "Outcome"
+        method  = "Method"
+        rate_diff = "Diff (minority-white)"
+        std_err = "Std Error"
+        lower_cl = "95% Lower"
+        upper_cl = "95% Upper"
+        pvalue = "P-Value"
+        dollar_impact_300k = "$ Impact on $300K Loan"
         direction_note = "Direction"
-        finding    = "Interpretation";
+        finding = "Interpretation";
 run;
 
 /* ============================================================
-   STEP 6: FLAGGED ADVERSE FINDINGS ONLY
+   STEP 6: FLAGGED ADVERSE FINDINGS
    ============================================================ */
 
 proc print data=summary_all noobs label;
   where finding contains 'ADVERSE';
   title "FLAGGED ADVERSE FINDINGS - REQUIRES REVIEW";
-  var group outcome method rate_diff std_err
-      pvalue finding;
-  format rate_diff std_err 10.5 pvalue 6.4;
-run;
-
-/* If no rows print, show explicit "no findings" message */
-data _null_;
-  set summary_all;
-  where finding contains 'ADVERSE';
-  if _n_ = 1 then put "Adverse findings detected - see above";
+  var group outcome method rate_diff std_err pvalue
+      dollar_impact_300k finding;
+  format rate_diff std_err 12.6 pvalue 6.4
+         dollar_impact_300k dollar10.2;
 run;
 
 /* ============================================================
-   STEP 7: PIVOT VIEW - SIDE-BY-SIDE METHOD COMPARISON
+   STEP 7: PIVOT VIEW - METHOD COMPARISON
    ============================================================ */
 
-proc tabulate data=summary_all format=10.5;
+proc tabulate data=summary_all format=12.6;
   class group outcome method;
   var rate_diff pvalue;
   table group='Group'*outcome='Outcome',
         method=''*(rate_diff='Disparity'*sum=''
                    pvalue='P-Val'*sum=''*f=6.4)
         / box='Multi-Method Comparison';
-  title "PIVOT VIEW: GLM vs IPW Side-By-Side";
+  title "PIVOT: GLM vs IPW Side-By-Side";
 run;
 
 /* ============================================================
-   STEP 8: EXPORT FULL ANALYSIS TO EXCEL
+   STEP 8: EXPORT TO EXCEL
    ============================================================ */
 
 ods excel file="&path\Fair_Lending_Multi_Outcome_2024.xlsx"
@@ -379,19 +397,22 @@ proc print data=summary_all noobs label;
   title "Fair Lending Disparity Analysis - 2024 HMDA";
   title2 "All Outcomes, All Groups, Both Methods";
   var group outcome method rate_diff std_err
-      lower_cl upper_cl pvalue direction_note finding;
-  format rate_diff std_err lower_cl upper_cl 10.5
-         pvalue 6.4;
+      lower_cl upper_cl pvalue dollar_impact_300k 
+      direction_note finding;
+  format rate_diff std_err lower_cl upper_cl 12.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
 run;
 
-/* Sheet 2: Adverse only */
+/* Sheet 2: Adverse findings only */
 ods excel options(sheet_name="Adverse Findings");
 proc print data=summary_all noobs label;
   where finding contains 'ADVERSE';
   title "Flagged Adverse Findings";
   var group outcome method rate_diff std_err
-      pvalue finding;
-  format rate_diff std_err 10.5 pvalue 6.4;
+      pvalue dollar_impact_300k finding;
+  format rate_diff std_err 12.6 pvalue 6.4
+         dollar_impact_300k dollar10.2;
 run;
 
 /* Sheet 3: GLM only */
@@ -400,7 +421,7 @@ proc print data=summary_all noobs label;
   where method = 'GLM_Adjusted';
   var group outcome rate_diff std_err lower_cl
       upper_cl pvalue finding;
-  format rate_diff std_err lower_cl upper_cl 10.5
+  format rate_diff std_err lower_cl upper_cl 12.6
          pvalue 6.4;
 run;
 
@@ -410,7 +431,7 @@ proc print data=summary_all noobs label;
   where method = 'IPW_DR';
   var group outcome rate_diff std_err lower_cl
       upper_cl pvalue finding;
-  format rate_diff std_err lower_cl upper_cl 10.5
+  format rate_diff std_err lower_cl upper_cl 12.6
          pvalue 6.4;
 run;
 
