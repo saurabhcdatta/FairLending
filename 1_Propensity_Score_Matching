@@ -1,5 +1,5 @@
 /* ============================================================
-   FAIR LENDING PSM ANALYSIS - MULTI-GROUP
+   FAIR LENDING PSM ANALYSIS - MULTI-GROUP - FINAL
    HMDA 2024 | Credit Union | White as Baseline
    Groups: Black, Hispanic, Asian
    ============================================================ */
@@ -18,7 +18,6 @@ data hmda_race;
   keep_aw = (asian=1 or white=1);
 run;
 
-/* Sanity check - confirm group sizes */
 proc freq data=hmda_race;
   tables black white hisp asian
          keep_bw keep_hw keep_aw / missing;
@@ -26,19 +25,19 @@ proc freq data=hmda_race;
 run;
 
 /* ============================================================
-   STEP 2: DEFINE PSM MACRO
+   STEP 2: PSM MACRO WITH PROPER RESULT CAPTURE
    ============================================================ */
 
 %macro fair_lending_psm(
-  group   =,   /* black / hisp / asian          */
-  label   =,   /* Display label for titles      */
-  keepvar =    /* keep_bw / keep_hw / keep_aw   */
+  group   =,
+  label   =,
+  keepvar =
 );
 
   title "=== FAIR LENDING: &label vs. White ===";
 
   /* ----------------------------------------------------------
-     2A: SUBSET TO COMPARISON PAIR
+     2A: SUBSET
      ---------------------------------------------------------- */
   data analysis_&group;
     set hmda_race;
@@ -53,7 +52,6 @@ run;
 
   /* ----------------------------------------------------------
      2B: PROPENSITY SCORE MODEL
-     MSA dummies removed to avoid separation in small groups
      ---------------------------------------------------------- */
   ods graphics on;
 
@@ -76,7 +74,7 @@ run;
   ods graphics off;
 
   /* ----------------------------------------------------------
-     2C: PSM MATCHING - 1:1 Optimal, caliper 0.25
+     2C: PSM MATCHING
      ---------------------------------------------------------- */
   ods graphics on;
 
@@ -107,7 +105,7 @@ run;
   ods graphics off;
 
   /* ----------------------------------------------------------
-     2D: BALANCE DIAGNOSTICS
+     2D: BALANCE
      ---------------------------------------------------------- */
   proc means data=matched_&group mean stddev;
     class treated;
@@ -117,61 +115,47 @@ run;
   run;
 
   /* ----------------------------------------------------------
-     2E: OUTCOME LOOP - ALL PRICING VARIABLES
+     2E: T-TEST for unadjusted comparison
+     Capture the ttests output table
      ---------------------------------------------------------- */
-  %let outcomes = numeric_rate Discount_Points_LA
-                  Lender_Credits_LA Loan_Cost_Prc_LA;
-  %let i = 1;
+  ods output Statistics = ttest_stats_&group
+             TTests     = ttest_pvals_&group;
 
-  %do %while (%scan(&outcomes, &i) ne );
-    %let var = %scan(&outcomes, &i);
-
-    /* Simple matched t-test */
-    proc ttest data=matched_&group;
-      weight loan_amt;
-      class treated;
-      var &var;
-      title "T-Test | &label vs White | &var";
-    run;
-
-    /* Fully adjusted GLM - primary finding */
-    ods output LSMeanDiffCL = diff_&group._&i;
-
-    proc glm data=matched_&group;
-      class treated
-        LTV_2a--LTV_6a CS_1a--CS_5a
-        Broker Other_Lien Offers_Other_Types
-        Lender_0_500--Lender_5000_10000
-        M1-M11;
-      model &var =
-        treated
-        Discount_Points_LA
-        Lender_Credits_LA
-        Loan_Cost_Prc_LA
-        LTV_2a--LTV_6a
-        CS_1a--CS_5a
-        Broker Other_Lien
-        Offers_Other_Types
-        Lender_0_500--Lender_5000_10000
-        M1-M11
-        / solution;
-      lsmeans treated / stderr pdiff cl;
-      title "Adjusted GLM | &label vs White | &var";
-    run;
-    quit;
-
-    /* Asymptotic Wilcoxon - fast, fine for n>=30 */
-    proc npar1way data=matched_&group wilcoxon;
-      class treated;
-      var &var;
-      title "Wilcoxon | &label vs White | &var";
-    run;
-
-    %let i = %eval(&i + 1);
-  %end;
+  proc ttest data=matched_&group;
+    weight loan_amt;
+    class treated;
+    var numeric_rate;
+    title "T-Test | &label vs White | numeric_rate";
+  run;
 
   /* ----------------------------------------------------------
-     2F: DOUBLY-ROBUST IPW ESTIMATION
+     2F: ADJUSTED GLM
+     Capture parameter estimates directly - more reliable
+     than LSMeans table
+     ---------------------------------------------------------- */
+  ods output ParameterEstimates = glm_parms_&group;
+
+  proc glm data=matched_&group;
+    class treated
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11;
+    model numeric_rate =
+      treated
+      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11
+      / solution clparm;
+    title "Adjusted GLM | &label vs White | numeric_rate";
+  run;
+  quit;
+
+  /* ----------------------------------------------------------
+     2G: DOUBLY-ROBUST IPW
+     Capture parameter estimates from GENMOD
      ---------------------------------------------------------- */
   proc sql noprint;
     select count(*) into :n_treated trimmed
@@ -185,33 +169,70 @@ run;
     if treated=1
       then sipw = (&n_treated/&n_total) / pscore;
     else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
-    /* Trim extreme weights at 10x */
     if sipw > 10 then sipw = 10;
   run;
+
+  ods output ParameterEstimates = ipw_parms_&group;
 
   proc genmod data=ps_ipw_&group;
     class treated M1-M11
           LTV_2a--LTV_6a CS_1a--CS_5a;
     model numeric_rate =
       treated
-      Discount_Points_LA Lender_Credits_LA
-      Loan_Cost_Prc_LA
+      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
       LTV_2a--LTV_6a CS_1a--CS_5a
       M1-M11
       / dist=normal link=identity;
     weight sipw;
-    lsmeans treated / diff cl;
     title "Doubly-Robust IPW | &label vs White | Rate";
   run;
 
   /* ----------------------------------------------------------
-     2G: SAVE KEY RESULT FOR SUMMARY TABLE
+     2H: BUILD CLEAN RESULT ROWS FOR THIS GROUP
      ---------------------------------------------------------- */
-  data result_&group;
-    set diff_&group._1;         /* numeric_rate GLM result */
-    length group $12;
-    group = "&label";
-    keep group Estimate LowerCL UpperCL Probt;
+
+  /* GLM result - extract treated coefficient */
+  data glm_result_&group;
+    set glm_parms_&group;
+    where Parameter contains 'treated' and Parameter ne '';
+    length group $12 method $15;
+    group  = "&label";
+    method = "GLM_Adjusted";
+    /* GLM with class variable: coefficient is for level 0
+       so flip sign to get (treated - control) */
+    rate_diff = -1 * Estimate;
+    std_err   = StdErr;
+    pvalue    = Probt;
+    lower_cl  = -1 * UpperCL;
+    upper_cl  = -1 * LowerCL;
+    keep group method rate_diff std_err pvalue lower_cl upper_cl;
+  run;
+
+  /* IPW result - extract treated coefficient */
+  data ipw_result_&group;
+    set ipw_parms_&group;
+    where Parameter contains 'treated' and Level1 = '1';
+    length group $12 method $15;
+    group  = "&label";
+    method = "IPW_DR";
+    rate_diff = Estimate;
+    std_err   = StdErr;
+    pvalue    = ProbChiSq;
+    lower_cl  = LowerWaldCL;
+    upper_cl  = UpperWaldCL;
+    keep group method rate_diff std_err pvalue lower_cl upper_cl;
+  run;
+
+  /* T-test result */
+  data ttest_result_&group;
+    set ttest_pvals_&group;
+    where Method = 'Pooled';
+    length group $12 method $15;
+    group  = "&label";
+    method = "Unadjusted_t";
+    /* Probt from ttest is two-sided */
+    pvalue = Probt;
+    keep group method pvalue;
   run;
 
 %mend fair_lending_psm;
@@ -220,74 +241,73 @@ run;
    STEP 3: RUN ALL THREE COMPARISONS
    ============================================================ */
 
-%fair_lending_psm(
-  group   = black,
-  label   = Black,
-  keepvar = keep_bw
-);
-
-%fair_lending_psm(
-  group   = hisp,
-  label   = Hispanic,
-  keepvar = keep_hw
-);
-
-%fair_lending_psm(
-  group   = asian,
-  label   = Asian,
-  keepvar = keep_aw
-);
+%fair_lending_psm(group=black, label=Black,    keepvar=keep_bw);
+%fair_lending_psm(group=hisp,  label=Hispanic, keepvar=keep_hw);
+%fair_lending_psm(group=asian, label=Asian,    keepvar=keep_aw);
 
 /* ============================================================
-   STEP 4: COMBINED SUMMARY TABLE
+   STEP 4: COMBINED SUMMARY - GLM + IPW
    ============================================================ */
 
+data summary_glm;
+  set glm_result_black
+      glm_result_hisp
+      glm_result_asian;
+run;
+
+data summary_ipw;
+  set ipw_result_black
+      ipw_result_hisp
+      ipw_result_asian;
+run;
+
 data summary_all;
-  set result_black
-      result_hisp
-      result_asian;
+  set summary_glm summary_ipw;
+  length finding $30;
+  if pvalue ne . and pvalue < 0.05 and rate_diff > 0
+    then finding = "*** ADVERSE - SIGNIFICANT";
+  else if pvalue ne . and pvalue < 0.10 and rate_diff > 0
+    then finding = "** ADVERSE - MARGINAL";
+  else if pvalue ne . and pvalue < 0.05 and rate_diff < 0
+    then finding = "Favorable - significant";
+  else if rate_diff ne . and rate_diff < 0
+    then finding = "Favorable - not significant";
+  else if rate_diff ne . and rate_diff >= 0
+    then finding = "No significant disparity";
+  else finding = "Result unavailable";
+run;
+
+proc sort data=summary_all;
+  by group method;
 run;
 
 proc print data=summary_all noobs;
-  title "SUMMARY: Adjusted Rate Disparity vs White";
-  format Estimate LowerCL UpperCL 8.4
-         Probt    6.4;
-  label Estimate = "Rate Diff (minority - white)"
-        LowerCL  = "95% CI Lower"
-        UpperCL  = "95% CI Upper"
-        Probt    = "P-Value";
-run;
-
-/* Flag significant findings */
-data summary_flagged;
-  set summary_all;
-  length finding $30;
-  if Probt < 0.05 and Estimate > 0
-    then finding = "*** ADVERSE - SIGNIFICANT";
-  else if Probt < 0.10 and Estimate > 0
-    then finding = "** ADVERSE - MARGINAL";
-  else if Estimate < 0
-    then finding = "Favorable to minority";
-  else finding = "No significant disparity";
-run;
-
-proc print data=summary_flagged noobs;
-  title "FAIR LENDING FINDINGS SUMMARY - 2024 HMDA";
-  var group Estimate LowerCL UpperCL Probt finding;
-  format Estimate LowerCL UpperCL 8.4
-         Probt 6.4;
+  title "FAIR LENDING RATE DISPARITY SUMMARY - 2024 HMDA";
+  title2 "Both GLM (matched) and IPW (doubly-robust) Methods";
+  var group method rate_diff std_err lower_cl upper_cl pvalue finding;
+  format rate_diff std_err lower_cl upper_cl 8.4
+         pvalue 6.4;
+  label rate_diff = "Rate Diff (minority - white)"
+        std_err   = "Std Error"
+        lower_cl  = "95% Lower"
+        upper_cl  = "95% Upper"
+        pvalue    = "P-Value"
+        finding   = "Interpretation";
 run;
 
 /* ============================================================
-   STEP 5: EXPORT SUMMARY TO EXCEL
+   STEP 5: EXPORT TO EXCEL
    ============================================================ */
 
 ods excel file="&path\Fair_Lending_Summary_2024.xlsx"
           options(sheet_name="Rate Disparities"
                   embedded_titles="yes");
 
-proc print data=summary_flagged noobs;
+proc print data=summary_all noobs;
   title "Fair Lending Rate Disparity Analysis - 2024 HMDA";
+  var group method rate_diff std_err lower_cl upper_cl pvalue finding;
+  format rate_diff std_err lower_cl upper_cl 8.4
+         pvalue 6.4;
 run;
 
 ods excel close;
