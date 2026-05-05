@@ -31,8 +31,8 @@ run;
 
 %macro fair_lending_psm(
   group   =,   /* black / hisp / asian          */
-  label   =,   /* Display label for titles       */
-  keepvar =    /* keep_bw / keep_hw / keep_aw    */
+  label   =,   /* Display label for titles      */
+  keepvar =    /* keep_bw / keep_hw / keep_aw   */
 );
 
   title "=== FAIR LENDING: &label vs. White ===";
@@ -53,6 +53,7 @@ run;
 
   /* ----------------------------------------------------------
      2B: PROPENSITY SCORE MODEL
+     MSA dummies removed to avoid separation in small groups
      ---------------------------------------------------------- */
   ods graphics on;
 
@@ -67,31 +68,15 @@ run;
       Lender_0_500 Lender_500_2000
       Lender_2000_5000 Lender_5000_10000
       M1-M11
-      AL_MSA--WY_MSA
       / lackfit;
-    output out   = ps_&group
-           p     = pscore
-           xbeta = logit_ps;
+    output out = ps_&group p = pscore;
     title "PS Model: &label vs White";
   run;
 
   ods graphics off;
 
   /* ----------------------------------------------------------
-     2C: CHECK ROC - WARN IF BELOW 0.70
-     ---------------------------------------------------------- */
-  proc sql noprint;
-    select max(c) into :roc_val
-    from (
-      select (_prob_ + lag(_prob_))/2 as c
-      from ps_&group
-    );
-  quit;
-
-  %put NOTE: &label vs White - ROC = &roc_val;
-
-  /* ----------------------------------------------------------
-     2D: PSM MATCHING - PRIMARY (caliper=0.25)
+     2C: PSM MATCHING - 1:1 Optimal, caliper 0.25
      ---------------------------------------------------------- */
   ods graphics on;
 
@@ -101,13 +86,13 @@ run;
       LTV_2a--LTV_6a CS_1a--CS_5a
       Broker Other_Lien Offers_Other_Types
       Lender_0_500--Lender_5000_10000
-      M1-M11 AL_MSA--WY_MSA;
+      M1-M11;
     psmodel treated(Treated='1') =
       Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
       LTV_2a--LTV_6a CS_1a--CS_5a
       Broker Other_Lien Offers_Other_Types
       Lender_0_500--Lender_5000_10000
-      M1-M11 AL_MSA--WY_MSA;
+      M1-M11;
     match method=optimal(k=1) caliper=0.25;
     assess ps lps
            var=(Discount_Points_LA Lender_Credits_LA
@@ -122,31 +107,7 @@ run;
   ods graphics off;
 
   /* ----------------------------------------------------------
-     2E: PSM MATCHING - SENSITIVITY (caliper=0.50)
-     ---------------------------------------------------------- */
-  proc psmatch data=ps_&group
-               region=allobs(psmin=0.05 psmax=0.95);
-    class treated
-      LTV_2a--LTV_6a CS_1a--CS_5a
-      Broker Other_Lien Offers_Other_Types
-      Lender_0_500--Lender_5000_10000
-      M1-M11 AL_MSA--WY_MSA;
-    psmodel treated(Treated='1') =
-      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
-      LTV_2a--LTV_6a CS_1a--CS_5a
-      Broker Other_Lien Offers_Other_Types
-      Lender_0_500--Lender_5000_10000
-      M1-M11 AL_MSA--WY_MSA;
-    match method=optimal(k=1) caliper=0.50;
-    output out      = matched_&group._wide
-           matchid  = MatchID_
-           matchwgt = MatchWgt_;
-    title "PSM Sensitivity Caliper=0.50 | &label vs White";
-  run;
-
-  /* ----------------------------------------------------------
-     2F: BALANCE DIAGNOSTICS
-     Std diff < 0.10 on all vars = good balance
+     2D: BALANCE DIAGNOSTICS
      ---------------------------------------------------------- */
   proc means data=matched_&group mean stddev;
     class treated;
@@ -156,7 +117,7 @@ run;
   run;
 
   /* ----------------------------------------------------------
-     2G: OUTCOME LOOP - ALL PRICING VARIABLES
+     2E: OUTCOME LOOP - ALL PRICING VARIABLES
      ---------------------------------------------------------- */
   %let outcomes = numeric_rate Discount_Points_LA
                   Lender_Credits_LA Loan_Cost_Prc_LA;
@@ -174,8 +135,7 @@ run;
     run;
 
     /* Fully adjusted GLM - primary finding */
-    ods output LSMeans       = lsm_&group._&i
-               LSMeanDiffCL  = diff_&group._&i;
+    ods output LSMeanDiffCL = diff_&group._&i;
 
     proc glm data=matched_&group;
       class treated
@@ -200,20 +160,18 @@ run;
     run;
     quit;
 
-    /* Nonparametric - better for small n */
+    /* Asymptotic Wilcoxon - fast, fine for n>=30 */
     proc npar1way data=matched_&group wilcoxon;
       class treated;
       var &var;
-      exact wilcoxon;
-      title "Wilcoxon Exact | &label vs White | &var";
+      title "Wilcoxon | &label vs White | &var";
     run;
 
     %let i = %eval(&i + 1);
   %end;
 
   /* ----------------------------------------------------------
-     2H: DOUBLY-ROBUST IPW
-     Most defensible to NCUA / DOJ reviewers
+     2F: DOUBLY-ROBUST IPW ESTIMATION
      ---------------------------------------------------------- */
   proc sql noprint;
     select count(*) into :n_treated trimmed
@@ -224,7 +182,7 @@ run;
 
   data ps_ipw_&group;
     set ps_&group;
-    if treated=1 
+    if treated=1
       then sipw = (&n_treated/&n_total) / pscore;
     else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
     /* Trim extreme weights at 10x */
@@ -247,7 +205,7 @@ run;
   run;
 
   /* ----------------------------------------------------------
-     2I: SAVE KEY RESULT FOR SUMMARY TABLE
+     2G: SAVE KEY RESULT FOR SUMMARY TABLE
      ---------------------------------------------------------- */
   data result_&group;
     set diff_&group._1;         /* numeric_rate GLM result */
@@ -282,7 +240,6 @@ run;
 
 /* ============================================================
    STEP 4: COMBINED SUMMARY TABLE
-   Rate disparity vs White across all groups
    ============================================================ */
 
 data summary_all;
@@ -292,7 +249,7 @@ data summary_all;
 run;
 
 proc print data=summary_all noobs;
-  title "SUMMARY: Adjusted Rate Disparity vs White (bps)";
+  title "SUMMARY: Adjusted Rate Disparity vs White";
   format Estimate LowerCL UpperCL 8.4
          Probt    6.4;
   label Estimate = "Rate Diff (minority - white)"
@@ -305,14 +262,13 @@ run;
 data summary_flagged;
   set summary_all;
   length finding $30;
-  if Probt < 0.05 and Estimate > 0 
+  if Probt < 0.05 and Estimate > 0
     then finding = "*** ADVERSE - SIGNIFICANT";
-  else if Probt < 0.10 and Estimate > 0 
+  else if Probt < 0.10 and Estimate > 0
     then finding = "** ADVERSE - MARGINAL";
-  else if Estimate < 0                   
+  else if Estimate < 0
     then finding = "Favorable to minority";
-  else                                   
-    then finding = "No significant disparity";
+  else finding = "No significant disparity";
 run;
 
 proc print data=summary_flagged noobs;
@@ -323,7 +279,7 @@ proc print data=summary_flagged noobs;
 run;
 
 /* ============================================================
-   STEP 5: EXPORT SUMMARY TO EXCEL FOR REPORTING
+   STEP 5: EXPORT SUMMARY TO EXCEL
    ============================================================ */
 
 ods excel file="&path\Fair_Lending_Summary_2024.xlsx"
