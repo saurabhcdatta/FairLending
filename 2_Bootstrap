@@ -5,10 +5,18 @@
    Groups: Black, Hispanic, Asian
    ============================================================ */
 
+/* SUPPRESS LOG NOISE - applied globally */
+options nonotes nosource nosource2 errors=0 
+        msglevel=N noquotelenmax;
+
 %let path = S:\Projects\OCFP_Fair_Lending\2024_NEW\data;
 libname hmda24 "&path";
 
-%let B = 10000;   /* Bootstrap reps - 10K is sufficient for 2-decimal p-value precision */
+%let B = 10000;   /* Bootstrap reps */
+
+/* Redirect log to file - prevents Log Window Full dialog */
+proc printto log="&path\analysis_run.log" new;
+run;
 
 /* ============================================================
    STEP 1: PREP DATA WITH KEEP FLAGS + COMPOSITE COST
@@ -17,12 +25,10 @@ libname hmda24 "&path";
 data hmda_race;
   set hmda24.eslfcu;
 
-  /* Keep flags for each comparison */
   keep_bw = (black=1 or white=1);
   keep_hw = (hisp=1  or white=1);
   keep_aw = (asian=1 or white=1);
 
-  /* Composite all-in cost */
   all_in_cost = (numeric_rate / 100)
               + Discount_Points_LA
               - Lender_Credits_LA
@@ -47,7 +53,6 @@ run;
 
   title "=== PSM PIPELINE: &label vs. White ===";
 
-  /* 2A: Subset */
   data analysis_&group;
     set hmda_race;
     where &keepvar = 1;
@@ -59,7 +64,7 @@ run;
     title "N: &label (1) vs White (0)";
   run;
 
-  /* 2B: PS Model */
+  /* PS Model */
   ods graphics on;
 
   proc logistic data=analysis_&group desc
@@ -79,7 +84,7 @@ run;
 
   ods graphics off;
 
-  /* 2C: Matching */
+  /* Matching */
   ods graphics on;
 
   proc psmatch data=ps_&group
@@ -116,7 +121,7 @@ run;
                   + Loan_Cost_Prc_LA;
   run;
 
-  /* 2D: Balance */
+  /* Balance */
   proc means data=matched_&group mean stddev;
     class treated;
     var Discount_Points_LA Lender_Credits_LA
@@ -124,7 +129,7 @@ run;
     title "Post-Match Balance | &label vs White";
   run;
 
-  /* 2E: IPW Dataset */
+  /* IPW Dataset */
   proc sql noprint;
     select count(*) into :n_treated trimmed
     from analysis_&group where treated=1;
@@ -145,7 +150,7 @@ run;
                   + Loan_Cost_Prc_LA;
   run;
 
-  /* 2F: Outcome loop - GLM and IPW */
+  /* Outcome loop */
   %let outcomes = numeric_rate Discount_Points_LA
                   Lender_Credits_LA Loan_Cost_Prc_LA
                   all_in_cost;
@@ -154,7 +159,6 @@ run;
   %do %while (%scan(&outcomes, &i) ne );
     %let var = %scan(&outcomes, &i);
 
-    /* Dynamic control list - exclude outcome from RHS */
     %let pricing_controls =;
     %if &var ne Discount_Points_LA %then
       %let pricing_controls = &pricing_controls Discount_Points_LA;
@@ -252,7 +256,6 @@ run;
 
 /* ============================================================
    STEP 3: ADJUSTED BOOTSTRAP MACRO
-   Bootstraps the regression-adjusted disparity coefficient
    ============================================================ */
 
 %macro bootstrap_adjusted(
@@ -262,9 +265,6 @@ run;
   outcome =
 );
 
-  title "=== ADJ BOOTSTRAP: &label vs White | &outcome ===";
-
-  /* Subset for this comparison */
   data boot_input_&group._&outcome;
     set hmda_race;
     where &keepvar = 1
@@ -273,7 +273,6 @@ run;
     treated = &group;
   run;
 
-  /* Stratified resampling - preserve group sizes */
   proc surveyselect data=boot_input_&group._&outcome
     method=URS rate=1 outhits
     reps=&B seed=987654
@@ -282,7 +281,6 @@ run;
     strata treated;
   run;
 
-  /* Build dynamic control list */
   %let pricing_controls =;
   %if &outcome ne Discount_Points_LA %then
     %let pricing_controls = &pricing_controls Discount_Points_LA;
@@ -292,8 +290,9 @@ run;
     %let pricing_controls = &pricing_controls Loan_Cost_Prc_LA;
   %if &outcome = all_in_cost %then %let pricing_controls = ;
 
-  /* Run adjusted regression on every bootstrap sample */
-  ods select none;
+  /* Run regression on every replicate - log noise suppressed */
+  ods _all_ close;
+  ods listing close;
   ods output ParameterEstimates = boot_parms_&group._&outcome;
 
   proc glm data=boot_samples_&group._&outcome;
@@ -310,19 +309,20 @@ run;
     weight loan_amt;
   run;
   quit;
-  ods select all;
 
-  /* Extract treated coefficient from each replicate */
+  ods listing;
+  ods output close;
+
+  /* Extract treated coefficient */
   data boot_coefs_&group._&outcome;
     set boot_parms_&group._&outcome;
     where Parameter contains 'treated'
       and Estimate ne 0;
-    /* Sign flip - SAS class codes 0 first */
     adj_diff = -1 * Estimate;
     keep Replicate adj_diff;
   run;
 
-  /* Bootstrap CI from coefficient distribution */
+  /* CI from bootstrap distribution */
   proc univariate data=boot_coefs_&group._&outcome noprint;
     var adj_diff;
     output out=boot_ci_&group._&outcome
@@ -331,9 +331,7 @@ run;
       pctlpts=2.5 50 97.5;
   run;
 
-  /* Bias-corrected CI */
-  /* First get observed coefficient from full sample */
-  ods select none;
+  /* Observed coefficient on actual data */
   ods output ParameterEstimates = obs_parms_&group._&outcome;
 
   proc glm data=boot_input_&group._&outcome;
@@ -349,7 +347,6 @@ run;
     weight loan_amt;
   run;
   quit;
-  ods select all;
 
   data obs_coef_&group._&outcome;
     set obs_parms_&group._&outcome;
@@ -363,37 +360,11 @@ run;
     from obs_coef_&group._&outcome;
   quit;
 
-  /* BC bias correction */
-  proc sql noprint;
-    select sum(adj_diff < &obs_coef) / count(*)
-      into :p0 trimmed
-    from boot_coefs_&group._&outcome;
-  quit;
-
-  data bc_ci_&group._&outcome;
-    z0 = probit(&p0);
-    z_lo = probit(0.025);
-    z_hi = probit(0.975);
-    bc_pct_lo = probnorm(2*z0 + z_lo) * 100;
-    bc_pct_hi = probnorm(2*z0 + z_hi) * 100;
-    call symputx('bc_lo', bc_pct_lo);
-    call symputx('bc_hi', bc_pct_hi);
-  run;
-
-  /* Apply BC percentiles to bootstrap distribution */
-  proc univariate data=boot_coefs_&group._&outcome noprint;
-    var adj_diff;
-    output out=bc_pct_&group._&outcome
-      pctlpre=bc_
-      pctlpts=&bc_lo &bc_hi;
-  run;
-
-  /* Bootstrap p-value: prob coefficient could be zero */
+  /* Bootstrap p-value */
   data boot_pval_&group._&outcome;
     set boot_coefs_&group._&outcome end=last;
     retain ge 0 tot 0;
     tot + 1;
-    /* Two-sided: test H0 that diff = 0 */
     if abs(adj_diff) >= abs(&obs_coef) then ge + 1;
     if last then do;
       boot_p = ge / tot;
@@ -402,7 +373,7 @@ run;
     keep boot_p;
   run;
 
-  /* Build final result row */
+  /* Build result row */
   data boot_result_&group._&outcome;
     length group $12 method $20 outcome $25;
     if _n_ = 1 then do;
@@ -424,7 +395,7 @@ run;
 %mend bootstrap_adjusted;
 
 /* ============================================================
-   STEP 4: RUN FULL PSM ANALYSIS FOR ALL GROUPS
+   STEP 4: RUN FULL PSM ANALYSIS
    ============================================================ */
 
 %fair_lending_psm(group=black, label=Black,    keepvar=keep_bw);
@@ -432,7 +403,7 @@ run;
 %fair_lending_psm(group=asian, label=Asian,    keepvar=keep_aw);
 
 /* ============================================================
-   STEP 5: RUN ADJUSTED BOOTSTRAP FOR ALL GROUPS x OUTCOMES
+   STEP 5: RUN ADJUSTED BOOTSTRAP
    ============================================================ */
 
 %macro run_all_bootstraps;
@@ -469,7 +440,7 @@ run;
 %run_all_bootstraps;
 
 /* ============================================================
-   STEP 6: COMBINE ALL RESULTS - PSM + IPW + BOOTSTRAP
+   STEP 6: COMBINE ALL RESULTS
    ============================================================ */
 
 data all_bootstrap_results;
@@ -497,7 +468,6 @@ data summary_all;
       all_bootstrap_results;
   length finding $30 direction_note $20;
 
-  /* Direction: for credits, lower=adverse */
   if outcome = 'Lender_Credits_LA' then do;
     direction_note = "Lower=Adverse";
     if pvalue ne . and pvalue < 0.05 and rate_diff < 0
@@ -519,7 +489,6 @@ data summary_all;
     else finding = "No significant disparity";
   end;
 
-  /* Economic magnitude on $300K loan */
   if outcome in ('Discount_Points_LA' 'Lender_Credits_LA'
                  'Loan_Cost_Prc_LA' 'all_in_cost')
     then dollar_impact_300k = rate_diff * 300000;
@@ -532,9 +501,15 @@ proc sort data=summary_all;
 run;
 
 /* ============================================================
-   STEP 7: MASTER REPORT - ALL THREE METHODS
+   STEP 7: RESTORE NORMAL LOG AND PRINT REPORTS
    ============================================================ */
 
+proc printto;  /* Reset log to default */
+run;
+
+options notes source;
+
+/* Master Report */
 proc print data=summary_all noobs label;
   title "FAIR LENDING DISPARITY - 3 METHODS";
   title2 "PSM-GLM + IPW Doubly-Robust + Adjusted Bootstrap";
@@ -547,11 +522,7 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
-/* ============================================================
-   STEP 8: METHOD CONVERGENCE TABLE
-   Identifies findings where ALL 3 methods agree
-   ============================================================ */
-
+/* Method Convergence */
 proc sql;
   create table convergence as
   select
@@ -577,13 +548,9 @@ quit;
 
 proc print data=convergence noobs;
   title "METHOD CONVERGENCE ANALYSIS";
-  title2 "Findings Where Multiple Methods Agree";
 run;
 
-/* ============================================================
-   STEP 9: FLAGGED ADVERSE FINDINGS
-   ============================================================ */
-
+/* Adverse Findings */
 proc print data=summary_all noobs label;
   where finding contains 'ADVERSE';
   title "FLAGGED ADVERSE FINDINGS - ALL METHODS";
@@ -595,13 +562,12 @@ proc print data=summary_all noobs label;
 run;
 
 /* ============================================================
-   STEP 10: EXPORT TO EXCEL
+   STEP 8: EXPORT TO EXCEL
    ============================================================ */
 
 ods excel file="&path\Fair_Lending_Final_2024.xlsx"
           options(embedded_titles="yes");
 
-/* Sheet 1: Master detail */
 ods excel options(sheet_name="Full Detail");
 proc print data=summary_all noobs label;
   title "Fair Lending Analysis - All Methods, All Outcomes";
@@ -612,13 +578,11 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
-/* Sheet 2: Convergence */
 ods excel options(sheet_name="Method Convergence");
 proc print data=convergence noobs;
   title "Cross-Method Convergence";
 run;
 
-/* Sheet 3: Adverse findings */
 ods excel options(sheet_name="Adverse Findings");
 proc print data=summary_all noobs label;
   where finding contains 'ADVERSE';
@@ -630,7 +594,6 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
-/* Sheet 4: PSM-GLM only */
 ods excel options(sheet_name="PSM_GLM");
 proc print data=summary_all noobs label;
   where method = 'PSM_GLM';
@@ -641,7 +604,6 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
-/* Sheet 5: IPW only */
 ods excel options(sheet_name="IPW_Doubly_Robust");
 proc print data=summary_all noobs label;
   where method = 'IPW_DR';
@@ -652,7 +614,6 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
-/* Sheet 6: Bootstrap only */
 ods excel options(sheet_name="Adj_Bootstrap");
 proc print data=summary_all noobs label;
   where method = 'Adj_Bootstrap';
@@ -666,3 +627,4 @@ run;
 ods excel close;
 
 %put NOTE: Analysis complete. Output: &path\Fair_Lending_Final_2024.xlsx;
+%put NOTE: Detailed log saved to: &path\analysis_run.log;
