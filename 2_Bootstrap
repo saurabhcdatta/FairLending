@@ -1,0 +1,668 @@
+/* ============================================================
+   FAIR LENDING ANALYSIS - CONSOLIDATED FINAL CODE
+   Methods: PSM + GLM + IPW + Adjusted Bootstrap
+   HMDA 2024 | Credit Union | White as Baseline
+   Groups: Black, Hispanic, Asian
+   ============================================================ */
+
+%let path = S:\Projects\OCFP_Fair_Lending\2024_NEW\data;
+libname hmda24 "&path";
+
+%let B = 10000;   /* Bootstrap reps - 10K is sufficient for 2-decimal p-value precision */
+
+/* ============================================================
+   STEP 1: PREP DATA WITH KEEP FLAGS + COMPOSITE COST
+   ============================================================ */
+
+data hmda_race;
+  set hmda24.eslfcu;
+
+  /* Keep flags for each comparison */
+  keep_bw = (black=1 or white=1);
+  keep_hw = (hisp=1  or white=1);
+  keep_aw = (asian=1 or white=1);
+
+  /* Composite all-in cost */
+  all_in_cost = (numeric_rate / 100)
+              + Discount_Points_LA
+              - Lender_Credits_LA
+              + Loan_Cost_Prc_LA;
+run;
+
+proc freq data=hmda_race;
+  tables black white hisp asian
+         keep_bw keep_hw keep_aw / missing;
+  title "Sample Counts by Race Group";
+run;
+
+/* ============================================================
+   STEP 2: PSM + GLM + IPW MACRO
+   ============================================================ */
+
+%macro fair_lending_psm(
+  group   =,
+  label   =,
+  keepvar =
+);
+
+  title "=== PSM PIPELINE: &label vs. White ===";
+
+  /* 2A: Subset */
+  data analysis_&group;
+    set hmda_race;
+    where &keepvar = 1;
+    treated = &group;
+  run;
+
+  proc freq data=analysis_&group;
+    tables treated / missing;
+    title "N: &label (1) vs White (0)";
+  run;
+
+  /* 2B: PS Model */
+  ods graphics on;
+
+  proc logistic data=analysis_&group desc
+                plots(only)=(roc);
+    weight loan_Amt;
+    model treated =
+      LTV_2a LTV_3a LTV_4a LTV_5a LTV_6a
+      CS_1a  CS_2a  CS_3a  CS_4a  CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500 Lender_500_2000
+      Lender_2000_5000 Lender_5000_10000
+      M1-M11
+      / lackfit;
+    output out = ps_&group p = pscore;
+    title "PS Model: &label vs White";
+  run;
+
+  ods graphics off;
+
+  /* 2C: Matching */
+  ods graphics on;
+
+  proc psmatch data=ps_&group
+               region=allobs(psmin=0.05 psmax=0.95);
+    class treated
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11;
+    psmodel treated(Treated='1') =
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11;
+    match method=optimal(k=1) caliper=0.25;
+    assess ps lps
+           var=(Discount_Points_LA Lender_Credits_LA
+                Loan_Cost_Prc_LA numeric_rate)
+           / plots=all weight=none;
+    output out      = matched_&group
+           matchid  = MatchID_
+           matchwgt = MatchWgt_;
+    title "PSM 1:1 Optimal | &label vs White";
+  run;
+
+  ods graphics off;
+
+  data matched_&group;
+    set matched_&group;
+    if missing(all_in_cost) then
+      all_in_cost = (numeric_rate / 100)
+                  + Discount_Points_LA
+                  - Lender_Credits_LA
+                  + Loan_Cost_Prc_LA;
+  run;
+
+  /* 2D: Balance */
+  proc means data=matched_&group mean stddev;
+    class treated;
+    var Discount_Points_LA Lender_Credits_LA
+        Loan_Cost_Prc_LA numeric_rate all_in_cost pscore;
+    title "Post-Match Balance | &label vs White";
+  run;
+
+  /* 2E: IPW Dataset */
+  proc sql noprint;
+    select count(*) into :n_treated trimmed
+    from analysis_&group where treated=1;
+    select count(*) into :n_total trimmed
+    from analysis_&group;
+  quit;
+
+  data ps_ipw_&group;
+    set ps_&group;
+    if treated=1
+      then sipw = (&n_treated/&n_total) / pscore;
+    else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
+    if sipw > 10 then sipw = 10;
+    if missing(all_in_cost) then
+      all_in_cost = (numeric_rate / 100)
+                  + Discount_Points_LA
+                  - Lender_Credits_LA
+                  + Loan_Cost_Prc_LA;
+  run;
+
+  /* 2F: Outcome loop - GLM and IPW */
+  %let outcomes = numeric_rate Discount_Points_LA
+                  Lender_Credits_LA Loan_Cost_Prc_LA
+                  all_in_cost;
+  %let i = 1;
+
+  %do %while (%scan(&outcomes, &i) ne );
+    %let var = %scan(&outcomes, &i);
+
+    /* Dynamic control list - exclude outcome from RHS */
+    %let pricing_controls =;
+    %if &var ne Discount_Points_LA %then
+      %let pricing_controls = &pricing_controls Discount_Points_LA;
+    %if &var ne Lender_Credits_LA %then
+      %let pricing_controls = &pricing_controls Lender_Credits_LA;
+    %if &var ne Loan_Cost_Prc_LA %then
+      %let pricing_controls = &pricing_controls Loan_Cost_Prc_LA;
+    %if &var = all_in_cost %then %let pricing_controls = ;
+
+    /* GLM */
+    ods output ParameterEstimates = glm_parms_&group._&i;
+
+    proc glm data=matched_&group;
+      class treated
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        Broker Other_Lien Offers_Other_Types
+        Lender_0_500--Lender_5000_10000
+        M1-M11;
+      model &var =
+        treated
+        &pricing_controls
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        Broker Other_Lien Offers_Other_Types
+        Lender_0_500--Lender_5000_10000
+        M1-M11
+        / solution clparm;
+      title "GLM | &label vs White | &var";
+    run;
+    quit;
+
+    data glm_result_&group._&i;
+      set glm_parms_&group._&i;
+      where Parameter contains 'treated'
+        and Parameter ne ''
+        and Estimate ne 0;
+      length group $12 method $20 outcome $25;
+      group   = "&label";
+      method  = "PSM_GLM";
+      outcome = "&var";
+      rate_diff = -1 * Estimate;
+      std_err   = StdErr;
+      pvalue    = Probt;
+      lower_cl  = -1 * UpperCL;
+      upper_cl  = -1 * LowerCL;
+      keep group method outcome rate_diff std_err
+           pvalue lower_cl upper_cl;
+    run;
+
+    /* IPW */
+    ods output ParameterEstimates = ipw_parms_&group._&i;
+
+    proc genmod data=ps_ipw_&group;
+      class treated M1-M11
+            LTV_2a--LTV_6a CS_1a--CS_5a;
+      model &var =
+        treated
+        &pricing_controls
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        M1-M11
+        / dist=normal link=identity;
+      weight sipw;
+      title "IPW | &label vs White | &var";
+    run;
+
+    data ipw_result_&group._&i;
+      set ipw_parms_&group._&i;
+      where Parameter contains 'treated'
+        and Level1 = '1';
+      length group $12 method $20 outcome $25;
+      group   = "&label";
+      method  = "IPW_DR";
+      outcome = "&var";
+      rate_diff = Estimate;
+      std_err   = StdErr;
+      pvalue    = ProbChiSq;
+      lower_cl  = LowerWaldCL;
+      upper_cl  = UpperWaldCL;
+      keep group method outcome rate_diff std_err
+           pvalue lower_cl upper_cl;
+    run;
+
+    %let i = %eval(&i + 1);
+  %end;
+
+  data results_psm_&group;
+    set glm_result_&group._1 glm_result_&group._2
+        glm_result_&group._3 glm_result_&group._4
+        glm_result_&group._5
+        ipw_result_&group._1 ipw_result_&group._2
+        ipw_result_&group._3 ipw_result_&group._4
+        ipw_result_&group._5;
+  run;
+
+%mend fair_lending_psm;
+
+/* ============================================================
+   STEP 3: ADJUSTED BOOTSTRAP MACRO
+   Bootstraps the regression-adjusted disparity coefficient
+   ============================================================ */
+
+%macro bootstrap_adjusted(
+  group   =,
+  label   =,
+  keepvar =,
+  outcome =
+);
+
+  title "=== ADJ BOOTSTRAP: &label vs White | &outcome ===";
+
+  /* Subset for this comparison */
+  data boot_input_&group._&outcome;
+    set hmda_race;
+    where &keepvar = 1
+      and not missing(&outcome)
+      and loan_amt > 0;
+    treated = &group;
+  run;
+
+  /* Stratified resampling - preserve group sizes */
+  proc surveyselect data=boot_input_&group._&outcome
+    method=URS rate=1 outhits
+    reps=&B seed=987654
+    out=boot_samples_&group._&outcome
+    noprint;
+    strata treated;
+  run;
+
+  /* Build dynamic control list */
+  %let pricing_controls =;
+  %if &outcome ne Discount_Points_LA %then
+    %let pricing_controls = &pricing_controls Discount_Points_LA;
+  %if &outcome ne Lender_Credits_LA %then
+    %let pricing_controls = &pricing_controls Lender_Credits_LA;
+  %if &outcome ne Loan_Cost_Prc_LA %then
+    %let pricing_controls = &pricing_controls Loan_Cost_Prc_LA;
+  %if &outcome = all_in_cost %then %let pricing_controls = ;
+
+  /* Run adjusted regression on every bootstrap sample */
+  ods select none;
+  ods output ParameterEstimates = boot_parms_&group._&outcome;
+
+  proc glm data=boot_samples_&group._&outcome;
+    by Replicate;
+    class treated
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien;
+    model &outcome =
+      treated
+      &pricing_controls
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien
+      / solution;
+    weight loan_amt;
+  run;
+  quit;
+  ods select all;
+
+  /* Extract treated coefficient from each replicate */
+  data boot_coefs_&group._&outcome;
+    set boot_parms_&group._&outcome;
+    where Parameter contains 'treated'
+      and Estimate ne 0;
+    /* Sign flip - SAS class codes 0 first */
+    adj_diff = -1 * Estimate;
+    keep Replicate adj_diff;
+  run;
+
+  /* Bootstrap CI from coefficient distribution */
+  proc univariate data=boot_coefs_&group._&outcome noprint;
+    var adj_diff;
+    output out=boot_ci_&group._&outcome
+      mean = mean_coef
+      pctlpre=p_
+      pctlpts=2.5 50 97.5;
+  run;
+
+  /* Bias-corrected CI */
+  /* First get observed coefficient from full sample */
+  ods select none;
+  ods output ParameterEstimates = obs_parms_&group._&outcome;
+
+  proc glm data=boot_input_&group._&outcome;
+    class treated
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien;
+    model &outcome =
+      treated
+      &pricing_controls
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien
+      / solution;
+    weight loan_amt;
+  run;
+  quit;
+  ods select all;
+
+  data obs_coef_&group._&outcome;
+    set obs_parms_&group._&outcome;
+    where Parameter contains 'treated' and Estimate ne 0;
+    obs_diff = -1 * Estimate;
+    keep obs_diff;
+  run;
+
+  proc sql noprint;
+    select obs_diff into :obs_coef trimmed
+    from obs_coef_&group._&outcome;
+  quit;
+
+  /* BC bias correction */
+  proc sql noprint;
+    select sum(adj_diff < &obs_coef) / count(*)
+      into :p0 trimmed
+    from boot_coefs_&group._&outcome;
+  quit;
+
+  data bc_ci_&group._&outcome;
+    z0 = probit(&p0);
+    z_lo = probit(0.025);
+    z_hi = probit(0.975);
+    bc_pct_lo = probnorm(2*z0 + z_lo) * 100;
+    bc_pct_hi = probnorm(2*z0 + z_hi) * 100;
+    call symputx('bc_lo', bc_pct_lo);
+    call symputx('bc_hi', bc_pct_hi);
+  run;
+
+  /* Apply BC percentiles to bootstrap distribution */
+  proc univariate data=boot_coefs_&group._&outcome noprint;
+    var adj_diff;
+    output out=bc_pct_&group._&outcome
+      pctlpre=bc_
+      pctlpts=&bc_lo &bc_hi;
+  run;
+
+  /* Bootstrap p-value: prob coefficient could be zero */
+  data boot_pval_&group._&outcome;
+    set boot_coefs_&group._&outcome end=last;
+    retain ge 0 tot 0;
+    tot + 1;
+    /* Two-sided: test H0 that diff = 0 */
+    if abs(adj_diff) >= abs(&obs_coef) then ge + 1;
+    if last then do;
+      boot_p = ge / tot;
+      output;
+    end;
+    keep boot_p;
+  run;
+
+  /* Build final result row */
+  data boot_result_&group._&outcome;
+    length group $12 method $20 outcome $25;
+    if _n_ = 1 then do;
+      set boot_ci_&group._&outcome;
+      set boot_pval_&group._&outcome;
+    end;
+    group   = "&label";
+    method  = "Adj_Bootstrap";
+    outcome = "&outcome";
+    rate_diff = &obs_coef;
+    std_err   = .;
+    pvalue    = boot_p;
+    lower_cl  = p_2_5;
+    upper_cl  = p_97_5;
+    keep group method outcome rate_diff std_err
+         pvalue lower_cl upper_cl;
+  run;
+
+%mend bootstrap_adjusted;
+
+/* ============================================================
+   STEP 4: RUN FULL PSM ANALYSIS FOR ALL GROUPS
+   ============================================================ */
+
+%fair_lending_psm(group=black, label=Black,    keepvar=keep_bw);
+%fair_lending_psm(group=hisp,  label=Hispanic, keepvar=keep_hw);
+%fair_lending_psm(group=asian, label=Asian,    keepvar=keep_aw);
+
+/* ============================================================
+   STEP 5: RUN ADJUSTED BOOTSTRAP FOR ALL GROUPS x OUTCOMES
+   ============================================================ */
+
+%macro run_all_bootstraps;
+  %let outcomes = numeric_rate Discount_Points_LA
+                  Lender_Credits_LA Loan_Cost_Prc_LA
+                  all_in_cost;
+  %let groups   = black hisp asian;
+  %let labels   = Black Hispanic Asian;
+  %let keeps    = keep_bw keep_hw keep_aw;
+
+  %let g = 1;
+  %do %while (%scan(&groups, &g) ne );
+    %let grp = %scan(&groups, &g);
+    %let lbl = %scan(&labels, &g);
+    %let kep = %scan(&keeps, &g);
+
+    %let i = 1;
+    %do %while (%scan(&outcomes, &i) ne );
+      %let var = %scan(&outcomes, &i);
+
+      %bootstrap_adjusted(
+        group   = &grp,
+        label   = &lbl,
+        keepvar = &kep,
+        outcome = &var
+      );
+
+      %let i = %eval(&i + 1);
+    %end;
+    %let g = %eval(&g + 1);
+  %end;
+%mend;
+
+%run_all_bootstraps;
+
+/* ============================================================
+   STEP 6: COMBINE ALL RESULTS - PSM + IPW + BOOTSTRAP
+   ============================================================ */
+
+data all_bootstrap_results;
+  set boot_result_black_numeric_rate
+      boot_result_black_Discount_Points_LA
+      boot_result_black_Lender_Credits_LA
+      boot_result_black_Loan_Cost_Prc_LA
+      boot_result_black_all_in_cost
+      boot_result_hisp_numeric_rate
+      boot_result_hisp_Discount_Points_LA
+      boot_result_hisp_Lender_Credits_LA
+      boot_result_hisp_Loan_Cost_Prc_LA
+      boot_result_hisp_all_in_cost
+      boot_result_asian_numeric_rate
+      boot_result_asian_Discount_Points_LA
+      boot_result_asian_Lender_Credits_LA
+      boot_result_asian_Loan_Cost_Prc_LA
+      boot_result_asian_all_in_cost;
+run;
+
+data summary_all;
+  set results_psm_black
+      results_psm_hisp
+      results_psm_asian
+      all_bootstrap_results;
+  length finding $30 direction_note $20;
+
+  /* Direction: for credits, lower=adverse */
+  if outcome = 'Lender_Credits_LA' then do;
+    direction_note = "Lower=Adverse";
+    if pvalue ne . and pvalue < 0.05 and rate_diff < 0
+      then finding = "*** ADVERSE - SIGNIFICANT";
+    else if pvalue ne . and pvalue < 0.10 and rate_diff < 0
+      then finding = "** ADVERSE - MARGINAL";
+    else if rate_diff ne . and rate_diff > 0
+      then finding = "Favorable to minority";
+    else finding = "No significant disparity";
+  end;
+  else do;
+    direction_note = "Higher=Adverse";
+    if pvalue ne . and pvalue < 0.05 and rate_diff > 0
+      then finding = "*** ADVERSE - SIGNIFICANT";
+    else if pvalue ne . and pvalue < 0.10 and rate_diff > 0
+      then finding = "** ADVERSE - MARGINAL";
+    else if rate_diff ne . and rate_diff < 0
+      then finding = "Favorable to minority";
+    else finding = "No significant disparity";
+  end;
+
+  /* Economic magnitude on $300K loan */
+  if outcome in ('Discount_Points_LA' 'Lender_Credits_LA'
+                 'Loan_Cost_Prc_LA' 'all_in_cost')
+    then dollar_impact_300k = rate_diff * 300000;
+  else if outcome = 'numeric_rate'
+    then dollar_impact_300k = rate_diff * 300000 / 100;
+run;
+
+proc sort data=summary_all;
+  by group outcome method;
+run;
+
+/* ============================================================
+   STEP 7: MASTER REPORT - ALL THREE METHODS
+   ============================================================ */
+
+proc print data=summary_all noobs label;
+  title "FAIR LENDING DISPARITY - 3 METHODS";
+  title2 "PSM-GLM + IPW Doubly-Robust + Adjusted Bootstrap";
+  by group;
+  id group;
+  var outcome method rate_diff lower_cl upper_cl
+      pvalue dollar_impact_300k finding;
+  format rate_diff lower_cl upper_cl 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* ============================================================
+   STEP 8: METHOD CONVERGENCE TABLE
+   Identifies findings where ALL 3 methods agree
+   ============================================================ */
+
+proc sql;
+  create table convergence as
+  select
+    group,
+    outcome,
+    sum(case when finding contains 'ADVERSE' then 1 else 0 end)
+      as n_adverse,
+    sum(case when finding = 'Favorable to minority' then 1 else 0 end)
+      as n_favorable,
+    count(*) as n_methods,
+    case
+      when calculated n_adverse = 3 then '*** ROBUST ADVERSE'
+      when calculated n_adverse = 2 then '** LIKELY ADVERSE'
+      when calculated n_adverse = 1 then 'SINGLE-METHOD FLAG'
+      when calculated n_favorable = 3 then 'ROBUST FAVORABLE'
+      else 'NO DISPARITY'
+    end as convergence_finding length=25
+  from summary_all
+  where method in ('PSM_GLM' 'IPW_DR' 'Adj_Bootstrap')
+  group by group, outcome
+  order by group, outcome;
+quit;
+
+proc print data=convergence noobs;
+  title "METHOD CONVERGENCE ANALYSIS";
+  title2 "Findings Where Multiple Methods Agree";
+run;
+
+/* ============================================================
+   STEP 9: FLAGGED ADVERSE FINDINGS
+   ============================================================ */
+
+proc print data=summary_all noobs label;
+  where finding contains 'ADVERSE';
+  title "FLAGGED ADVERSE FINDINGS - ALL METHODS";
+  var group outcome method rate_diff pvalue
+      dollar_impact_300k finding;
+  format rate_diff 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* ============================================================
+   STEP 10: EXPORT TO EXCEL
+   ============================================================ */
+
+ods excel file="&path\Fair_Lending_Final_2024.xlsx"
+          options(embedded_titles="yes");
+
+/* Sheet 1: Master detail */
+ods excel options(sheet_name="Full Detail");
+proc print data=summary_all noobs label;
+  title "Fair Lending Analysis - All Methods, All Outcomes";
+  var group outcome method rate_diff lower_cl upper_cl
+      pvalue dollar_impact_300k finding;
+  format rate_diff lower_cl upper_cl 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* Sheet 2: Convergence */
+ods excel options(sheet_name="Method Convergence");
+proc print data=convergence noobs;
+  title "Cross-Method Convergence";
+run;
+
+/* Sheet 3: Adverse findings */
+ods excel options(sheet_name="Adverse Findings");
+proc print data=summary_all noobs label;
+  where finding contains 'ADVERSE';
+  title "Flagged Adverse Findings";
+  var group outcome method rate_diff pvalue
+      dollar_impact_300k finding;
+  format rate_diff 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* Sheet 4: PSM-GLM only */
+ods excel options(sheet_name="PSM_GLM");
+proc print data=summary_all noobs label;
+  where method = 'PSM_GLM';
+  var group outcome rate_diff lower_cl upper_cl
+      pvalue dollar_impact_300k finding;
+  format rate_diff lower_cl upper_cl 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* Sheet 5: IPW only */
+ods excel options(sheet_name="IPW_Doubly_Robust");
+proc print data=summary_all noobs label;
+  where method = 'IPW_DR';
+  var group outcome rate_diff lower_cl upper_cl
+      pvalue dollar_impact_300k finding;
+  format rate_diff lower_cl upper_cl 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* Sheet 6: Bootstrap only */
+ods excel options(sheet_name="Adj_Bootstrap");
+proc print data=summary_all noobs label;
+  where method = 'Adj_Bootstrap';
+  var group outcome rate_diff lower_cl upper_cl
+      pvalue dollar_impact_300k finding;
+  format rate_diff lower_cl upper_cl 10.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+ods excel close;
+
+%put NOTE: Analysis complete. Output: &path\Fair_Lending_Final_2024.xlsx;
