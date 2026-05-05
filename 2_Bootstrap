@@ -1,25 +1,24 @@
 /* ============================================================
-   FAIR LENDING ANALYSIS - CONSOLIDATED FINAL CODE
+   FAIR LENDING ANALYSIS - CONSOLIDATED FINAL CODE V2
    Methods: PSM + GLM + IPW + Adjusted Bootstrap
+   FIXED: IPW and Bootstrap parameter capture filters
    HMDA 2024 | Credit Union | White as Baseline
    Groups: Black, Hispanic, Asian
    ============================================================ */
 
-/* SUPPRESS LOG NOISE - applied globally */
-options nonotes nosource nosource2 errors=0 
+options nonotes nosource nosource2 errors=0
         msglevel=N noquotelenmax;
 
 %let path = S:\Projects\OCFP_Fair_Lending\2024_NEW\data;
 libname hmda24 "&path";
 
-%let B = 10000;   /* Bootstrap reps */
+%let B = 10000;
 
-/* Redirect log to file - prevents Log Window Full dialog */
 proc printto log="&path\analysis_run.log" new;
 run;
 
 /* ============================================================
-   STEP 1: PREP DATA WITH KEEP FLAGS + COMPOSITE COST
+   STEP 1: PREP DATA
    ============================================================ */
 
 data hmda_race;
@@ -189,11 +188,13 @@ run;
     run;
     quit;
 
+    /* GLM result - FIXED filter */
     data glm_result_&group._&i;
       set glm_parms_&group._&i;
-      where Parameter contains 'treated'
-        and Parameter ne ''
-        and Estimate ne 0;
+      where (Parameter = 'treated' 
+             or Parameter contains 'treated')
+        and Estimate ne 0
+        and Estimate ne .;
       length group $12 method $20 outcome $25;
       group   = "&label";
       method  = "PSM_GLM";
@@ -207,7 +208,7 @@ run;
            pvalue lower_cl upper_cl;
     run;
 
-    /* IPW */
+    /* IPW - using NOBOUND to avoid issues */
     ods output ParameterEstimates = ipw_parms_&group._&i;
 
     proc genmod data=ps_ipw_&group;
@@ -223,19 +224,32 @@ run;
       title "IPW | &label vs White | &var";
     run;
 
+    /* IPW result - FIXED filter handles multiple SAS versions */
     data ipw_result_&group._&i;
       set ipw_parms_&group._&i;
-      where Parameter contains 'treated'
-        and Level1 = '1';
+      /* Match treated parameter - works whether SAS uses
+         Parameter='treated 1', Parameter='treated' with Level1='1',
+         or any other variant */
+      where (Parameter = 'treated'
+             or Parameter contains 'treated')
+        and Estimate ne 0
+        and Estimate ne .;
       length group $12 method $20 outcome $25;
       group   = "&label";
       method  = "IPW_DR";
       outcome = "&var";
       rate_diff = Estimate;
-      std_err   = StdErr;
-      pvalue    = ProbChiSq;
-      lower_cl  = LowerWaldCL;
-      upper_cl  = UpperWaldCL;
+      /* Standard error column name varies by SAS version */
+      if not missing(StdErr)     then std_err = StdErr;
+      else if not missing(stderr) then std_err = stderr;
+      /* P-value column varies too */
+      if not missing(ProbChiSq)  then pvalue = ProbChiSq;
+      else if not missing(Probt) then pvalue = Probt;
+      /* CI columns vary */
+      if not missing(LowerWaldCL) then lower_cl = LowerWaldCL;
+      else if not missing(LowerCL) then lower_cl = LowerCL;
+      if not missing(UpperWaldCL) then upper_cl = UpperWaldCL;
+      else if not missing(UpperCL) then upper_cl = UpperCL;
       keep group method outcome rate_diff std_err
            pvalue lower_cl upper_cl;
     run;
@@ -255,7 +269,7 @@ run;
 %mend fair_lending_psm;
 
 /* ============================================================
-   STEP 3: ADJUSTED BOOTSTRAP MACRO
+   STEP 3: ADJUSTED BOOTSTRAP MACRO - FIXED
    ============================================================ */
 
 %macro bootstrap_adjusted(
@@ -290,7 +304,6 @@ run;
     %let pricing_controls = &pricing_controls Loan_Cost_Prc_LA;
   %if &outcome = all_in_cost %then %let pricing_controls = ;
 
-  /* Run regression on every replicate - log noise suppressed */
   ods _all_ close;
   ods listing close;
   ods output ParameterEstimates = boot_parms_&group._&outcome;
@@ -313,16 +326,40 @@ run;
   ods listing;
   ods output close;
 
-  /* Extract treated coefficient */
+  /* Extract treated coefficient - FIXED filter */
   data boot_coefs_&group._&outcome;
     set boot_parms_&group._&outcome;
-    where Parameter contains 'treated'
-      and Estimate ne 0;
+    where (Parameter = 'treated' 
+           or Parameter contains 'treated')
+      and Estimate ne 0
+      and Estimate ne .;
     adj_diff = -1 * Estimate;
     keep Replicate adj_diff;
   run;
 
-  /* CI from bootstrap distribution */
+  /* Verify we have coefficients */
+  proc sql noprint;
+    select count(*) into :n_coefs trimmed
+    from boot_coefs_&group._&outcome;
+  quit;
+
+  %if &n_coefs = 0 %then %do;
+    %put WARNING: No bootstrap coefficients captured for &group &outcome;
+    /* Create empty result so combine step works */
+    data boot_result_&group._&outcome;
+      length group $12 method $20 outcome $25;
+      group   = "&label";
+      method  = "Adj_Bootstrap";
+      outcome = "&outcome";
+      rate_diff = .;
+      std_err = .;
+      pvalue = .;
+      lower_cl = .;
+      upper_cl = .;
+    run;
+    %return;
+  %end;
+
   proc univariate data=boot_coefs_&group._&outcome noprint;
     var adj_diff;
     output out=boot_ci_&group._&outcome
@@ -331,7 +368,7 @@ run;
       pctlpts=2.5 50 97.5;
   run;
 
-  /* Observed coefficient on actual data */
+  /* Observed coefficient */
   ods output ParameterEstimates = obs_parms_&group._&outcome;
 
   proc glm data=boot_input_&group._&outcome;
@@ -350,7 +387,10 @@ run;
 
   data obs_coef_&group._&outcome;
     set obs_parms_&group._&outcome;
-    where Parameter contains 'treated' and Estimate ne 0;
+    where (Parameter = 'treated'
+           or Parameter contains 'treated')
+      and Estimate ne 0
+      and Estimate ne .;
     obs_diff = -1 * Estimate;
     keep obs_diff;
   run;
@@ -395,7 +435,7 @@ run;
 %mend bootstrap_adjusted;
 
 /* ============================================================
-   STEP 4: RUN FULL PSM ANALYSIS
+   STEP 4: RUN PSM + IPW
    ============================================================ */
 
 %fair_lending_psm(group=black, label=Black,    keepvar=keep_bw);
@@ -403,7 +443,7 @@ run;
 %fair_lending_psm(group=asian, label=Asian,    keepvar=keep_aw);
 
 /* ============================================================
-   STEP 5: RUN ADJUSTED BOOTSTRAP
+   STEP 5: RUN BOOTSTRAP
    ============================================================ */
 
 %macro run_all_bootstraps;
@@ -501,18 +541,16 @@ proc sort data=summary_all;
 run;
 
 /* ============================================================
-   STEP 7: RESTORE NORMAL LOG AND PRINT REPORTS
+   STEP 7: RESTORE LOG AND PRINT
    ============================================================ */
 
-proc printto;  /* Reset log to default */
+proc printto;
 run;
 
 options notes source;
 
-/* Master Report */
 proc print data=summary_all noobs label;
   title "FAIR LENDING DISPARITY - 3 METHODS";
-  title2 "PSM-GLM + IPW Doubly-Robust + Adjusted Bootstrap";
   by group;
   id group;
   var outcome method rate_diff lower_cl upper_cl
@@ -522,7 +560,6 @@ proc print data=summary_all noobs label;
          dollar_impact_300k dollar10.2;
 run;
 
-/* Method Convergence */
 proc sql;
   create table convergence as
   select
@@ -550,14 +587,12 @@ proc print data=convergence noobs;
   title "METHOD CONVERGENCE ANALYSIS";
 run;
 
-/* Adverse Findings */
 proc print data=summary_all noobs label;
   where finding contains 'ADVERSE';
-  title "FLAGGED ADVERSE FINDINGS - ALL METHODS";
+  title "FLAGGED ADVERSE FINDINGS";
   var group outcome method rate_diff pvalue
       dollar_impact_300k finding;
-  format rate_diff 10.6
-         pvalue 6.4
+  format rate_diff 10.6 pvalue 6.4
          dollar_impact_300k dollar10.2;
 run;
 
@@ -570,12 +605,11 @@ ods excel file="&path\Fair_Lending_Final_2024.xlsx"
 
 ods excel options(sheet_name="Full Detail");
 proc print data=summary_all noobs label;
-  title "Fair Lending Analysis - All Methods, All Outcomes";
+  title "Fair Lending Analysis - All Methods";
   var group outcome method rate_diff lower_cl upper_cl
       pvalue dollar_impact_300k finding;
   format rate_diff lower_cl upper_cl 10.6
-         pvalue 6.4
-         dollar_impact_300k dollar10.2;
+         pvalue 6.4 dollar_impact_300k dollar10.2;
 run;
 
 ods excel options(sheet_name="Method Convergence");
@@ -586,11 +620,9 @@ run;
 ods excel options(sheet_name="Adverse Findings");
 proc print data=summary_all noobs label;
   where finding contains 'ADVERSE';
-  title "Flagged Adverse Findings";
   var group outcome method rate_diff pvalue
       dollar_impact_300k finding;
-  format rate_diff 10.6
-         pvalue 6.4
+  format rate_diff 10.6 pvalue 6.4
          dollar_impact_300k dollar10.2;
 run;
 
@@ -600,8 +632,7 @@ proc print data=summary_all noobs label;
   var group outcome rate_diff lower_cl upper_cl
       pvalue dollar_impact_300k finding;
   format rate_diff lower_cl upper_cl 10.6
-         pvalue 6.4
-         dollar_impact_300k dollar10.2;
+         pvalue 6.4 dollar_impact_300k dollar10.2;
 run;
 
 ods excel options(sheet_name="IPW_Doubly_Robust");
@@ -610,8 +641,7 @@ proc print data=summary_all noobs label;
   var group outcome rate_diff lower_cl upper_cl
       pvalue dollar_impact_300k finding;
   format rate_diff lower_cl upper_cl 10.6
-         pvalue 6.4
-         dollar_impact_300k dollar10.2;
+         pvalue 6.4 dollar_impact_300k dollar10.2;
 run;
 
 ods excel options(sheet_name="Adj_Bootstrap");
@@ -620,11 +650,9 @@ proc print data=summary_all noobs label;
   var group outcome rate_diff lower_cl upper_cl
       pvalue dollar_impact_300k finding;
   format rate_diff lower_cl upper_cl 10.6
-         pvalue 6.4
-         dollar_impact_300k dollar10.2;
+         pvalue 6.4 dollar_impact_300k dollar10.2;
 run;
 
 ods excel close;
 
-%put NOTE: Analysis complete. Output: &path\Fair_Lending_Final_2024.xlsx;
-%put NOTE: Detailed log saved to: &path\analysis_run.log;
+%put NOTE: Analysis complete.;
