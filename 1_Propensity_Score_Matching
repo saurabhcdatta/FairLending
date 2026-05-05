@@ -1,72 +1,59 @@
-/* ============================================
-   MULTI-GROUP FAIR LENDING PSM ANALYSIS
-   HMDA 2024 | Baseline = WHITE borrowers
-   Groups: BLACK, HISPANIC, ASIAN
-   ============================================ */
+/* ============================================================
+   FAIR LENDING PSM ANALYSIS - MULTI-GROUP
+   HMDA 2024 | Credit Union | White as Baseline
+   Groups: Black, Hispanic, Asian
+   ============================================================ */
 
 %let path = S:\Projects\OCFP_Fair_Lending\2024_NEW\data;
 libname hmda24 "&path";
 
-/* ============================================
-   STEP 1: CREATE RACE INDICATOR VARIABLES
-   Assumes HMDA derived_race field exists
-   Adjust variable name to match your data
-   ============================================ */
+/* ============================================================
+   STEP 1: CREATE DATASET WITH KEEP FLAGS
+   ============================================================ */
 
 data hmda_race;
   set hmda24.eslfcu;
-
-  /* Binary indicators - White is reference */
-  BLACK    = (derived_race = 'Black or African American');
-  HISPANIC = (derived_race = 'Hispanic or Latino');
-  ASIAN    = (derived_race = 'Asian');
-  WHITE    = (derived_race = 'White');
-
-  /* For each comparison, keep only the 
-     relevant two groups */
-  keep_bw = (BLACK=1    or WHITE=1);
-  keep_hw = (HISPANIC=1 or WHITE=1);
-  keep_aw = (ASIAN=1    or WHITE=1);
+  keep_bw = (black=1 or white=1);
+  keep_hw = (hisp=1  or white=1);
+  keep_aw = (asian=1 or white=1);
 run;
 
-/* Quick counts by group */
+/* Sanity check - confirm group sizes */
 proc freq data=hmda_race;
-  tables derived_race / missing;
-  title "Sample Counts by Race";
+  tables black white hisp asian
+         keep_bw keep_hw keep_aw / missing;
+  title "Sample Counts by Race Group";
 run;
 
-/* ============================================
-   STEP 2: DEFINE REUSABLE MACRO
-   One macro handles all three comparisons
-   - group:    treatment group name (BLACK etc)
-   - groupval: value = 1 for treated
-   - label:    display label
-   ============================================ */
+/* ============================================================
+   STEP 2: DEFINE PSM MACRO
+   ============================================================ */
 
 %macro fair_lending_psm(
-  group  =,   /* Variable name: BLACK / HISPANIC / ASIAN */
-  label  =,   /* Display label for titles               */
-  keepvar=    /* keep_bw / keep_hw / keep_aw            */
+  group   =,   /* black / hisp / asian          */
+  label   =,   /* Display label for titles       */
+  keepvar =    /* keep_bw / keep_hw / keep_aw    */
 );
 
-  title "=== FAIR LENDING ANALYSIS: &label vs. WHITE ===";
+  title "=== FAIR LENDING: &label vs. White ===";
 
-  /* ---- Subset to this comparison group ---- */
+  /* ----------------------------------------------------------
+     2A: SUBSET TO COMPARISON PAIR
+     ---------------------------------------------------------- */
   data analysis_&group;
     set hmda_race;
     where &keepvar = 1;
-    /* Recode: treated=1 is minority, 0=White */
     treated = &group;
   run;
 
   proc freq data=analysis_&group;
     tables treated / missing;
-    title "Sample Size: &label (1) vs White (0)";
+    title "N: &label (1) vs White (0)";
   run;
 
-  /* ----------------------------------------
-     2A: PROPENSITY SCORE MODEL
-     ---------------------------------------- */
+  /* ----------------------------------------------------------
+     2B: PROPENSITY SCORE MODEL
+     ---------------------------------------------------------- */
   ods graphics on;
 
   proc logistic data=analysis_&group desc
@@ -82,20 +69,32 @@ run;
       M1-M11
       AL_MSA--WY_MSA
       / lackfit;
-    output out  = ps_&group
-           p    = pscore
-           xbeta= logit_ps;
-    title "PS Model: &label vs White | ROC Check";
+    output out   = ps_&group
+           p     = pscore
+           xbeta = logit_ps;
+    title "PS Model: &label vs White";
   run;
 
   ods graphics off;
 
-  /* ----------------------------------------
-     2B: PSM MATCHING - Primary + Sensitivity
-     ---------------------------------------- */
+  /* ----------------------------------------------------------
+     2C: CHECK ROC - WARN IF BELOW 0.70
+     ---------------------------------------------------------- */
+  proc sql noprint;
+    select max(c) into :roc_val
+    from (
+      select (_prob_ + lag(_prob_))/2 as c
+      from ps_&group
+    );
+  quit;
+
+  %put NOTE: &label vs White - ROC = &roc_val;
+
+  /* ----------------------------------------------------------
+     2D: PSM MATCHING - PRIMARY (caliper=0.25)
+     ---------------------------------------------------------- */
   ods graphics on;
 
-  /* Primary: 1:1 optimal, caliper 0.25 */
   proc psmatch data=ps_&group
                region=allobs(psmin=0.05 psmax=0.95);
     class treated
@@ -114,34 +113,55 @@ run;
            var=(Discount_Points_LA Lender_Credits_LA
                 Loan_Cost_Prc_LA numeric_rate)
            / plots=all weight=none;
-    output out     = matched_&group
-           matchid = MatchID_
-           matchwgt= MatchWgt_;
-    title "PSM Matching: &label vs White";
+    output out      = matched_&group
+           matchid  = MatchID_
+           matchwgt = MatchWgt_;
+    title "PSM 1:1 Optimal | &label vs White";
   run;
 
   ods graphics off;
 
-  /* ----------------------------------------
-     2C: BALANCE CHECK
-     Std diff < 0.10 on all covariates
-     ---------------------------------------- */
+  /* ----------------------------------------------------------
+     2E: PSM MATCHING - SENSITIVITY (caliper=0.50)
+     ---------------------------------------------------------- */
+  proc psmatch data=ps_&group
+               region=allobs(psmin=0.05 psmax=0.95);
+    class treated
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11 AL_MSA--WY_MSA;
+    psmodel treated(Treated='1') =
+      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11 AL_MSA--WY_MSA;
+    match method=optimal(k=1) caliper=0.50;
+    output out      = matched_&group._wide
+           matchid  = MatchID_
+           matchwgt = MatchWgt_;
+    title "PSM Sensitivity Caliper=0.50 | &label vs White";
+  run;
+
+  /* ----------------------------------------------------------
+     2F: BALANCE DIAGNOSTICS
+     Std diff < 0.10 on all vars = good balance
+     ---------------------------------------------------------- */
   proc means data=matched_&group mean stddev;
     class treated;
     var Discount_Points_LA Lender_Credits_LA
         Loan_Cost_Prc_LA numeric_rate pscore;
-    title "Post-Match Balance: &label vs White";
+    title "Post-Match Balance | &label vs White";
   run;
 
-  /* ----------------------------------------
-     2D: OUTCOME ANALYSIS - FOUR VARIABLES
-     ---------------------------------------- */
-
-  /* Loop over all pricing outcomes */
+  /* ----------------------------------------------------------
+     2G: OUTCOME LOOP - ALL PRICING VARIABLES
+     ---------------------------------------------------------- */
   %let outcomes = numeric_rate Discount_Points_LA
                   Lender_Credits_LA Loan_Cost_Prc_LA;
-
   %let i = 1;
+
   %do %while (%scan(&outcomes, &i) ne );
     %let var = %scan(&outcomes, &i);
 
@@ -150,10 +170,13 @@ run;
       weight loan_amt;
       class treated;
       var &var;
-      title "T-Test | &label vs White | Outcome: &var";
+      title "T-Test | &label vs White | &var";
     run;
 
-    /* Fully adjusted GLM - primary result */
+    /* Fully adjusted GLM - primary finding */
+    ods output LSMeans       = lsm_&group._&i
+               LSMeanDiffCL  = diff_&group._&i;
+
     proc glm data=matched_&group;
       class treated
         LTV_2a--LTV_6a CS_1a--CS_5a
@@ -161,42 +184,50 @@ run;
         Lender_0_500--Lender_5000_10000
         M1-M11;
       model &var =
-        treated                      /* KEY coefficient    */
+        treated
         Discount_Points_LA
         Lender_Credits_LA
         Loan_Cost_Prc_LA
-        LTV_2a--LTV_6a               /* Risk controls      */
-        CS_1a--CS_5a                 /* Credit score tiers */
+        LTV_2a--LTV_6a
+        CS_1a--CS_5a
         Broker Other_Lien
         Offers_Other_Types
         Lender_0_500--Lender_5000_10000
-        M1-M11                       /* Seasonality FE     */
+        M1-M11
         / solution;
       lsmeans treated / stderr pdiff cl;
       title "Adjusted GLM | &label vs White | &var";
+    run;
+    quit;
+
+    /* Nonparametric - better for small n */
+    proc npar1way data=matched_&group wilcoxon;
+      class treated;
+      var &var;
+      exact wilcoxon;
+      title "Wilcoxon Exact | &label vs White | &var";
     run;
 
     %let i = %eval(&i + 1);
   %end;
 
-  /* ----------------------------------------
-     2E: DOUBLY-ROBUST IPW ESTIMATION
-     Most defensible to regulators
-     ---------------------------------------- */
-
-  /* Count group sizes for stabilized weights */
+  /* ----------------------------------------------------------
+     2H: DOUBLY-ROBUST IPW
+     Most defensible to NCUA / DOJ reviewers
+     ---------------------------------------------------------- */
   proc sql noprint;
-    select count(*) into :n_treated
+    select count(*) into :n_treated trimmed
     from analysis_&group where treated=1;
-    select count(*) into :n_total
+    select count(*) into :n_total trimmed
     from analysis_&group;
   quit;
 
   data ps_ipw_&group;
     set ps_&group;
-    if treated=1 then sipw = (&n_treated/&n_total) / pscore;
-    else              sipw = (1-(&n_treated/&n_total)) / (1-pscore);
-    /* Trim extreme weights */
+    if treated=1 
+      then sipw = (&n_treated/&n_total) / pscore;
+    else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
+    /* Trim extreme weights at 10x */
     if sipw > 10 then sipw = 10;
   run;
 
@@ -215,65 +246,92 @@ run;
     title "Doubly-Robust IPW | &label vs White | Rate";
   run;
 
-  /* ----------------------------------------
-     2F: EXACT WILCOXON - better for small n
-     ---------------------------------------- */
-  proc npar1way data=matched_&group wilcoxon;
-    class treated;
-    var numeric_rate;
-    exact wilcoxon;
-    title "Wilcoxon Exact | &label vs White";
+  /* ----------------------------------------------------------
+     2I: SAVE KEY RESULT FOR SUMMARY TABLE
+     ---------------------------------------------------------- */
+  data result_&group;
+    set diff_&group._1;         /* numeric_rate GLM result */
+    length group $12;
+    group = "&label";
+    keep group Estimate LowerCL UpperCL Probt;
   run;
 
 %mend fair_lending_psm;
 
-/* ============================================
+/* ============================================================
    STEP 3: RUN ALL THREE COMPARISONS
-   ============================================ */
+   ============================================================ */
 
 %fair_lending_psm(
-  group   = BLACK,
+  group   = black,
   label   = Black,
   keepvar = keep_bw
 );
 
 %fair_lending_psm(
-  group   = HISPANIC,
+  group   = hisp,
   label   = Hispanic,
   keepvar = keep_hw
 );
 
 %fair_lending_psm(
-  group   = ASIAN,
+  group   = asian,
   label   = Asian,
   keepvar = keep_aw
 );
 
-/* ============================================
-   STEP 4: SUMMARY COMPARISON TABLE
-   Pull LS-means differences across groups
-   into one clean summary
-   ============================================ */
+/* ============================================================
+   STEP 4: COMBINED SUMMARY TABLE
+   Rate disparity vs White across all groups
+   ============================================================ */
 
-/* Collect key results manually or via ODS OUTPUT */
-ods output LSMeanDiffCL = lsm_black  (where=(effect='treated'));
-ods output LSMeanDiffCL = lsm_hisp   (where=(effect='treated'));
-ods output LSMeanDiffCL = lsm_asian  (where=(effect='treated'));
-
-/* Combine for summary report */
-data summary_results;
-  length group $12 outcome $30;
-  set lsm_black  (in=b)
-      lsm_hisp   (in=h)
-      lsm_asian  (in=a);
-  if b then group = 'Black';
-  if h then group = 'Hispanic';
-  if a then group = 'Asian';
-  keep group outcome Estimate LowerCL UpperCL Probt;
+data summary_all;
+  set result_black
+      result_hisp
+      result_asian;
 run;
 
-proc print data=summary_results noobs;
-  title "SUMMARY: Adjusted Rate Disparities vs White";
+proc print data=summary_all noobs;
+  title "SUMMARY: Adjusted Rate Disparity vs White (bps)";
+  format Estimate LowerCL UpperCL 8.4
+         Probt    6.4;
+  label Estimate = "Rate Diff (minority - white)"
+        LowerCL  = "95% CI Lower"
+        UpperCL  = "95% CI Upper"
+        Probt    = "P-Value";
+run;
+
+/* Flag significant findings */
+data summary_flagged;
+  set summary_all;
+  length finding $30;
+  if Probt < 0.05 and Estimate > 0 
+    then finding = "*** ADVERSE - SIGNIFICANT";
+  else if Probt < 0.10 and Estimate > 0 
+    then finding = "** ADVERSE - MARGINAL";
+  else if Estimate < 0                   
+    then finding = "Favorable to minority";
+  else                                   
+    then finding = "No significant disparity";
+run;
+
+proc print data=summary_flagged noobs;
+  title "FAIR LENDING FINDINGS SUMMARY - 2024 HMDA";
+  var group Estimate LowerCL UpperCL Probt finding;
   format Estimate LowerCL UpperCL 8.4
          Probt 6.4;
 run;
+
+/* ============================================================
+   STEP 5: EXPORT SUMMARY TO EXCEL FOR REPORTING
+   ============================================================ */
+
+ods excel file="&path\Fair_Lending_Summary_2024.xlsx"
+          options(sheet_name="Rate Disparities"
+                  embedded_titles="yes");
+
+proc print data=summary_flagged noobs;
+  title "Fair Lending Rate Disparity Analysis - 2024 HMDA";
+run;
+
+ods excel close;
