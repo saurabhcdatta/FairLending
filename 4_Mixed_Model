@@ -1,0 +1,388 @@
+/*=============================================================================
+  PROGRAM:    esl_mixed_effects_v2.sas
+  PURPOSE:    Mixed-effects pricing model - v2 handles flat one-hot MSA dummy
+              encoding (variables like AZ_MSA, CA_MSA, NY_MSA) instead of a
+              single categorical MSA variable.
+
+  CHANGE FROM v1:
+    - MSA encoded as multiple binary indicators (state_MSA dummies)
+    - Auto-detect which MSA dummies have non-zero variation in ESL data
+    - Include those with variation as fixed effects (no CLASS needed)
+    - Drop those without variation (automatically zero, would be redundant)
+
+  USAGE NOTE:
+    The dummy detection logic uses PROC CONTENTS to find variables matching
+    "_MSA$" pattern. If your naming is different (e.g., MSA_AZ, msa_az, etc.),
+    adjust the LIKE pattern in Step 2 accordingly.
+=============================================================================*/
+
+options nofmterr nomprint nomlogic nosymbolgen;
+
+libname hmda24 "S:\Projects\OCFP_Fair_Lending\2024_NEW\data";
+libname out    "S:\Projects\OCFP_Fair_Lending\2024_NEW\data\mixed";
+
+%let SOURCE_DS = hmda24.reg_combinations_origs6;
+%let ESL_ID    = 26241;
+
+/*-----------------------------------------------------------------------------
+  STEP 1: ANALYTICAL SAMPLE
+-----------------------------------------------------------------------------*/
+data work.esl_loans;
+    set &SOURCE_DS.;
+    where join_number = &ESL_ID.
+      and action = 1
+      and not missing(Interest_Rate_Min_PMMS_1)
+      and not missing(credit_score)
+      and not missing(DTI_N)
+      and not missing(LTV_COMBINED)
+      and not missing(loan_amount)
+      and not missing(LN_TERM)
+      and race in ("WHITE","BLACK","HISP")
+      and loan_type    in (1, 2)
+      and loan_purpose in (1, 32)
+      and not missing(census_tract);
+
+    length tract_key $11;
+    tract_key = put(input(census_tract, ?? best12.), z11.);
+
+    d_fha     = (loan_type = 2);
+    d_cashout = (loan_purpose = 32);
+    is_black  = (race = "BLACK");
+    is_hisp   = (race = "HISP");
+run;
+
+/*-----------------------------------------------------------------------------
+  STEP 2: AUTO-DETECT USABLE MSA DUMMIES
+  Find columns matching MSA pattern, then check which have variation in
+  ESL's data. Build a macro variable list for use in model statements.
+-----------------------------------------------------------------------------*/
+
+/* Get all variable names matching MSA pattern from source dataset */
+proc contents data=&SOURCE_DS. out=work._cols (keep=name) noprint;
+run;
+
+/* Filter to MSA-like names. ADJUST the pattern if your naming differs. */
+data work._msa_candidates;
+    set work._cols;
+    upcase_name = upcase(name);
+    /* Match patterns like XX_MSA where XX is a 2-char state abbreviation */
+    if prxmatch("/^[A-Z]{2}_MSA$/i", strip(name)) then output;
+run;
+
+proc print data=work._msa_candidates;
+    title "MSA candidate variables found in source dataset";
+run;
+title;
+
+/* For each candidate, check sum across ESL loans. If sum=0, no variation. */
+proc sql noprint;
+    select strip(name) into :all_msa_vars separated by ' '
+    from work._msa_candidates;
+quit;
+
+%put NOTE: All MSA candidates: &all_msa_vars;
+
+/* Compute sum of each MSA dummy in ESL data */
+proc means data=work.esl_loans noprint;
+    var &all_msa_vars.;
+    output out=work._msa_sums sum=;
+run;
+
+/* Transpose to long, keep only those with sum > 0 (and < n_total to ensure variation) */
+proc sql noprint;
+    select count(*) into :n_esl trimmed from work.esl_loans;
+quit;
+
+proc transpose data=work._msa_sums(drop=_TYPE_ _FREQ_)
+               out=work._msa_long(rename=(_NAME_=msa_var COL1=msa_sum));
+run;
+
+data work._msa_used;
+    set work._msa_long;
+    /* Keep MSAs that have AT LEAST one loan but NOT all loans (need variation) */
+    if msa_sum > 0 and msa_sum < &n_esl;
+run;
+
+proc sql noprint;
+    select count(*) into :n_msa_used trimmed from work._msa_used;
+    select strip(msa_var) into :msa_used_list separated by ' '
+    from work._msa_used;
+quit;
+
+%put NOTE: ESL has &n_msa_used MSA dummies with usable variation;
+%put NOTE: Usable MSA list: &msa_used_list;
+
+proc print data=work._msa_used;
+    title "MSA dummies with variation in ESL data (n=&n_msa_used)";
+    title2 "These will be included as fixed effects";
+run;
+title;
+
+/* Macro that expands to MSA dummies if any have variation, else empty.
+   Drop one as the reference category to avoid collinearity with intercept. */
+%macro msa_terms;
+    %if &n_msa_used >= 2 %then %do;
+        /* Include all but the LAST one as reference (arbitrary choice) */
+        %let n_minus1 = %eval(&n_msa_used - 1);
+        %let msa_terms_use =;
+        %do i = 1 %to &n_minus1.;
+            %let msa_terms_use = &msa_terms_use. %scan(&msa_used_list., &i.);
+        %end;
+        &msa_terms_use.
+    %end;
+    %else %if &n_msa_used = 1 %then %do;
+        /* Single MSA = constant, dropping */
+    %end;
+%mend;
+
+%put NOTE: MSA terms to include in model: %msa_terms;
+
+/*-----------------------------------------------------------------------------
+  STEP 3: TRACT STRUCTURE DIAGNOSTIC
+-----------------------------------------------------------------------------*/
+proc sql;
+    title "Tract clustering structure";
+    create table work._tract_size as
+    select tract_key, count(*) as n_loans
+    from work.esl_loans group by tract_key;
+
+    select count(*)                                as n_tracts,
+           sum(case when n_loans=1 then 1 else 0 end) as n_singletons,
+           sum(case when n_loans>=2 then 1 else 0 end) as n_multi,
+           sum(case when n_loans>=2 then n_loans else 0 end) as n_loans_in_multi,
+           max(n_loans)                            as max_per_tract,
+           mean(n_loans)                           as avg_per_tract
+    from work._tract_size;
+quit;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 4: REGRESSOR LISTS
+-----------------------------------------------------------------------------*/
+%let X_FULL = credit_score DTI_N LTV_COMBINED loan_amount LN_TERM d_fha d_cashout;
+%let X_NOLA = credit_score DTI_N LTV_COMBINED             LN_TERM d_fha d_cashout;
+
+/*-----------------------------------------------------------------------------
+  STEP 5: MIXED-EFFECTS MACRO
+-----------------------------------------------------------------------------*/
+%macro mixed_one(
+    outcome=, outcome_label=,
+    x_vars=,
+    spec_label=,
+    out_summary=
+);
+
+    %put ====================================================================;
+    %put MIXED: outcome=&outcome, spec=&spec_label;
+    %put ====================================================================;
+
+    ods output SolutionF=work._fixed_eff
+               CovParms=work._cov_parms;
+
+    proc mixed data=work.esl_loans method=reml covtest noclprint=20;
+        class tract_key;
+        model &outcome. = is_black is_hisp &x_vars. %msa_terms
+                          / solution ddfm=bw cl;
+        random intercept / subject=tract_key;
+    run;
+
+    /* Pull race coefficients */
+    data work._summary_row;
+        length comparison $20 outcome $40 outcome_lbl $40 spec $20 effect $32;
+        outcome     = "&outcome.";
+        outcome_lbl = "&outcome_label.";
+        spec        = "&spec_label.";
+        n_msas_used = &n_msa_used;
+
+        set work._fixed_eff (where=(Effect in ("is_black","is_hisp")));
+
+        if Effect = "is_black" then comparison = "BLACK_vs_WHITE";
+        else if Effect = "is_hisp" then comparison = "HISP_vs_WHITE";
+
+        beta       = Estimate;
+        beta_se    = StdErr;
+        beta_pval  = Probt;
+        beta_lower = Lower;
+        beta_upper = Upper;
+        df_used    = DF;
+        sig_05     = (beta_pval < 0.05);
+
+        keep comparison outcome outcome_lbl spec effect
+             beta beta_se beta_pval beta_lower beta_upper
+             df_used sig_05 n_msas_used;
+    run;
+
+    proc append base=&out_summary. data=work._summary_row force; run;
+
+    /* Save variance components */
+    data work._cov_tagged;
+        length outcome $40 spec $20;
+        outcome = "&outcome.";
+        spec    = "&spec_label.";
+        set work._cov_parms;
+    run;
+    proc append base=out.mixed_covparms data=work._cov_tagged force; run;
+
+%mend mixed_one;
+
+/*-----------------------------------------------------------------------------
+  STEP 6: RUN ALL OUTCOMES x SPECS
+-----------------------------------------------------------------------------*/
+proc datasets library=out nolist;
+    delete mixed_summary mixed_memo mixed_covparms mixed_icc;
+quit;
+
+%macro run_all(outcome=, outcome_label=);
+    %mixed_one(outcome=&outcome., outcome_label=&outcome_label.,
+               x_vars=&X_FULL., spec_label=Full,
+               out_summary=out.mixed_summary);
+    %mixed_one(outcome=&outcome., outcome_label=&outcome_label.,
+               x_vars=&X_NOLA., spec_label=NoLoanAmt,
+               out_summary=out.mixed_summary);
+%mend;
+
+%run_all(outcome=Interest_Rate_Min_PMMS_1, outcome_label=Rate spread above PMMS);
+%run_all(outcome=Discount_Points_LA,       outcome_label=Discount points (% of loan));
+%run_all(outcome=Lender_Credits_LA,        outcome_label=Lender credits (% of loan));
+%run_all(outcome=Loan_Cost_Prc_LA,         outcome_label=Total loan costs (% of loan));
+
+/*-----------------------------------------------------------------------------
+  STEP 7: MEMO TABLE
+-----------------------------------------------------------------------------*/
+proc sql noprint;
+    select mean(loan_amount) into :avg_loan trimmed from work.esl_loans;
+quit;
+
+data out.mixed_memo;
+    set out.mixed_summary;
+
+    if outcome = "Interest_Rate_Min_PMMS_1" then do;
+        bp_estimate = beta * 100;
+        bp_lower    = beta_lower * 100;
+        bp_upper    = beta_upper * 100;
+        dollar_equiv = bp_estimate * &avg_loan / 10000;
+        unit = "bp rate spread";
+    end;
+    else do;
+        bp_estimate = beta * 10000;
+        bp_lower    = beta_lower * 10000;
+        bp_upper    = beta_upper * 10000;
+        dollar_equiv = beta * &avg_loan;
+        unit = "bp of loan amt";
+    end;
+
+    keep comparison outcome_lbl spec
+         bp_estimate bp_lower bp_upper beta_pval sig_05
+         dollar_equiv unit df_used;
+run;
+
+proc print data=out.mixed_memo noobs label;
+    title "Mixed-Effects Model - MEMO READY";
+    title2 "Average ESL loan: $%sysfunc(putn(&avg_loan, dollar12.0))";
+    title3 "Tract random intercepts + state-MSA fixed effects (where identified)";
+    title4 "Positive estimate = protected group pays MORE within tract";
+    label comparison    = "Comparison"
+          outcome_lbl   = "Outcome"
+          spec          = "Spec"
+          bp_estimate   = "Estimate (bp)"
+          bp_lower      = "CI lo (bp)"
+          bp_upper      = "CI hi (bp)"
+          beta_pval     = "p-value"
+          sig_05        = "Sig 0.05"
+          dollar_equiv  = "$ Equiv"
+          unit          = "Unit"
+          df_used       = "DF";
+    format bp_estimate bp_lower bp_upper 10.1
+           beta_pval pvalue6.4
+           dollar_equiv dollar12.2;
+    by comparison outcome_lbl notsorted;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 8: ICC DIAGNOSTIC
+-----------------------------------------------------------------------------*/
+proc sql;
+    create table out.mixed_icc as
+    select outcome, spec,
+           max(case when CovParm in ("Intercept","UN(1,1)") then Estimate else . end)
+                                                    as var_tract,
+           max(case when CovParm = "Residual"      then Estimate else . end)
+                                                    as var_resid,
+           calculated var_tract /
+               (calculated var_tract + calculated var_resid) as ICC format=percent8.2
+    from out.mixed_covparms
+    group by outcome, spec;
+quit;
+
+proc print data=out.mixed_icc noobs label;
+    title "Intraclass Correlation: tract-level share of residual variance";
+    label outcome="Outcome" spec="Spec" var_tract="Var(tract)"
+          var_resid="Var(residual)" ICC="ICC";
+    format var_tract var_resid 12.8;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 9: HEADLINE LOG DUMP
+-----------------------------------------------------------------------------*/
+proc sql noprint;
+    select bp_estimate, bp_lower, bp_upper, dollar_equiv, sig_05, df_used
+        into :bw_cost_bp, :bw_cost_lo, :bw_cost_hi, :bw_cost_dol, :bw_cost_sig, :bw_df
+    from out.mixed_memo
+    where comparison="BLACK_vs_WHITE"
+      and outcome_lbl="Total loan costs (% of loan)" and spec="Full";
+
+    select bp_estimate, sig_05 into :bw_cost_bp_nola, :bw_cost_sig_nola
+    from out.mixed_memo
+    where comparison="BLACK_vs_WHITE"
+      and outcome_lbl="Total loan costs (% of loan)" and spec="NoLoanAmt";
+
+    select bp_estimate, bp_lower, bp_upper, sig_05
+        into :bw_rate_bp, :bw_rate_lo, :bw_rate_hi, :bw_rate_sig
+    from out.mixed_memo
+    where comparison="BLACK_vs_WHITE"
+      and outcome_lbl="Rate spread above PMMS" and spec="Full";
+
+    select bp_estimate, bp_lower, bp_upper, dollar_equiv, sig_05
+        into :hw_cost_bp, :hw_cost_lo, :hw_cost_hi, :hw_cost_dol, :hw_cost_sig
+    from out.mixed_memo
+    where comparison="HISP_vs_WHITE"
+      and outcome_lbl="Total loan costs (% of loan)" and spec="Full";
+
+    select bp_estimate, sig_05 into :hw_rate_bp, :hw_rate_sig
+    from out.mixed_memo
+    where comparison="HISP_vs_WHITE"
+      and outcome_lbl="Rate spread above PMMS" and spec="Full";
+quit;
+
+%put ;
+%put ====================================================================;
+%put MIXED-EFFECTS HEADLINE FINDINGS;
+%put MSA dummies with variation: &n_msa_used;
+%put ====================================================================;
+%put ;
+%put BLACK vs WHITE:;
+%put   Total loan costs: &bw_cost_bp bp [&bw_cost_lo, &bw_cost_hi] sig=&bw_cost_sig;
+%put   Total loan costs ($): %sysfunc(round(&bw_cost_dol));
+%put   Total loan costs NoLoanAmt: &bw_cost_bp_nola bp sig=&bw_cost_sig_nola;
+%put   Rate spread:      &bw_rate_bp bp [&bw_rate_lo, &bw_rate_hi] sig=&bw_rate_sig;
+%put ;
+%put HISPANIC vs WHITE:;
+%put   Total loan costs: &hw_cost_bp bp [&hw_cost_lo, &hw_cost_hi] sig=&hw_cost_sig;
+%put   Total loan costs ($): %sysfunc(round(&hw_cost_dol));
+%put   Rate spread:      &hw_rate_bp bp sig=&hw_rate_sig;
+%put ;
+%put ====================================================================;
+%put TRIANGULATION - Black-White Total Loan Cost Disparity;
+%put ====================================================================;
+%put   Geographic peer (descriptive):    ~137 bp ($2540);
+%put   Oaxaca Full (with loan_amount):   51 bp   ($963);
+%put   Oaxaca NoLoanAmt:                 90 bp   ($1701);
+%put   Mixed-effects Full:               &bw_cost_bp bp ($%sysfunc(round(&bw_cost_dol)));
+%put   Mixed-effects NoLoanAmt:          &bw_cost_bp_nola bp;
+%put ====================================================================;
+
+/*=============================================================================
+  END
+=============================================================================*/
