@@ -1,0 +1,319 @@
+/*=============================================================================
+  PROGRAM:    esl_four_method_summary.sas
+  PURPOSE:    Build the integrated four-method comparison table for the
+              ESL fair lending memo. Pulls together:
+                Method 1: PSM-GLM + IPW Doubly-Robust (from prior analysis)
+                Method 2: Geographic-peer descriptive comparison
+                Method 3: Oaxaca-Blinder decomposition
+                Method 4: Mixed-effects with tract random intercepts
+
+  PRIOR PSM/IPW results hard-coded from handoff document. If the prior PSM
+  output dataset is still on disk at known path, can be read directly via
+  the alternate input path commented below.
+
+  KEY DIFFERENCE TO NOTE:
+    PSM/IPW used the pooled ESL+4-peer-CU sample (n=423).
+    Oaxaca/mixed-effects use ESL-only (n=403 after harmonization).
+    Geographic peer uses ESL + 3 different CU peers in shared tracts.
+    Each method tests a different counterfactual but they triangulate
+    on the same fair-lending question.
+
+=============================================================================*/
+
+options nofmterr nomprint nomlogic nosymbolgen;
+
+libname out "S:\Projects\OCFP_Fair_Lending\2024_NEW\data\summary";
+
+/*-----------------------------------------------------------------------------
+  STEP 1: BUILD CONSOLIDATED FOUR-METHOD COMPARISON DATASET
+  Each row = (method, comparison, outcome, spec/variant)
+-----------------------------------------------------------------------------*/
+
+data out.four_method_summary;
+    length method $30 comparison $20 outcome $40 variant $30
+           sample_desc $40 unit $20 sig_label $10;
+
+    /*=========================================================================
+      METHOD 1: PSM-GLM (from handoff doc)
+      Sample: ESL + 4 peer CUs pooled (n=423)
+      Reference loan: $300K
+    =========================================================================*/
+    method = "1. PSM-GLM";
+    sample_desc = "ESL+4 peers pooled (n=423)";
+    variant = "1:1 optimal match";
+    unit = "USD ($300K loan)";
+
+    /* Black-White total loan costs */
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 917;       p_value = 0.043;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig**", "n.s.");
+    n_protected = 60;            output;
+
+    /* Black-White origination charges (the smoking gun from prior memo) */
+    comparison="BLACK_vs_WHITE"; outcome="Origination charges";
+    estimate_dollar = 738;       p_value = 0.007;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig**", "n.s.");
+    n_protected = 60;            output;
+
+    /* Hispanic-White */
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 1214;      p_value = 0.003;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig**", "n.s.");
+    n_protected = .;             output;
+
+    comparison="HISP_vs_WHITE";  outcome="Origination charges";
+    estimate_dollar = 787;       p_value = 0.002;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig**", "n.s.");
+    n_protected = .;             output;
+
+    /*=========================================================================
+      METHOD 2: IPW DOUBLY-ROBUST (from handoff doc)
+      Sample: ESL + 4 peer CUs pooled (n=423)
+      Reference loan: $300K
+    =========================================================================*/
+    method = "2. IPW Doubly-Robust";
+    sample_desc = "ESL+4 peers pooled (n=423)";
+    variant = "Stabilized weights, trim=10";
+    unit = "USD ($300K loan)";
+
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 1109;      p_value = 0.004;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig**", "n.s.");
+    n_protected = 60;            output;
+
+    comparison="BLACK_vs_WHITE"; outcome="Origination charges";
+    estimate_dollar = 1375;      p_value = 0.0001;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig***", "n.s.");
+    n_protected = 60;            output;
+
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 1203;      p_value = 0.0001;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig***", "n.s.");
+    n_protected = .;             output;
+
+    comparison="HISP_vs_WHITE";  outcome="Origination charges";
+    estimate_dollar = 1032;      p_value = 0.0001;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig***", "n.s.");
+    n_protected = .;             output;
+
+    /*=========================================================================
+      METHOD 3: GEOGRAPHIC-PEER DESCRIPTIVE (this analysis)
+      Sample: ESL + 3 CU peers in shared tracts (n=73 ESL + 49 peer)
+      Reference loan: $185K average
+    =========================================================================*/
+    method = "3. Geographic-Peer Descriptive";
+    sample_desc = "ESL+3 peers in shared tracts (n=122)";
+    variant = "Pooled equal-weighted";
+    unit = "USD ($185K avg loan)";
+
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 2540;      p_value = .;  /* Not formally tested */
+    ci_lo_dollar = 1162;         ci_hi_dollar = 3804;
+    sig_05 = 1;                  sig_label = "Sig*";
+    n_protected = 11;            output;
+    /* Note: this is the Black-White cost gap derived from race-stratified
+       diff_cost in geographic-peer analysis (~137 bp on avg loan) */
+
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 1294;      p_value = .;
+    ci_lo_dollar = -1184;        ci_hi_dollar = 3514;
+    sig_05 = 0;                  sig_label = "n.s.";
+    n_protected = 11;            output;
+
+    /*=========================================================================
+      METHOD 4: OAXACA-BLINDER (this analysis)
+      Sample: ESL only, conventional/FHA owner-occupied purchase/cash-out
+      Reference loan: ~$187K (we will recalculate from data)
+    =========================================================================*/
+    method = "4a. Oaxaca-Blinder (Full)";
+    sample_desc = "ESL only (n=403)";
+    variant = "Neumark pooled-coef benchmark";
+    unit = "USD ($187K avg loan)";
+
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 963;       p_value = .;  /* point estimate only */
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = .;                  sig_label = "Pt est.";
+    n_protected = 60;            output;
+
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 634;       p_value = .;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = .;                  sig_label = "Pt est.";
+    n_protected = 67;            output;
+
+    /* NoLoanAmt sensitivity */
+    method = "4b. Oaxaca-Blinder (NoLoanAmt)";
+
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 1701;      p_value = .;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = .;                  sig_label = "Pt est.";
+    n_protected = 60;            output;
+
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 1414;      p_value = .;
+    ci_lo_dollar = .;            ci_hi_dollar = .;
+    sig_05 = .;                  sig_label = "Pt est.";
+    n_protected = 67;            output;
+
+    /*=========================================================================
+      METHOD 5: MIXED-EFFECTS (this analysis)
+      Sample: ESL only, conventional/FHA owner-occupied purchase/cash-out
+      Tract random intercepts; MSA fixed effects dropped (single MSA)
+    =========================================================================*/
+    method = "5a. Mixed-Effects (Full)";
+    sample_desc = "ESL only (n=403)";
+    variant = "Tract random intercepts";
+    unit = "USD ($187K avg loan)";
+
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 702;       p_value = 0.0023;
+    ci_lo_dollar = 253;          ci_hi_dollar = 1149;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig**", "n.s.");
+    n_protected = 60;            output;
+
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 520;       p_value = 0.0183;
+    ci_lo_dollar = 89;           ci_hi_dollar = 951;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig*", "n.s.");
+    n_protected = 67;            output;
+
+    method = "5b. Mixed-Effects (NoLoanAmt)";
+
+    comparison="BLACK_vs_WHITE"; outcome="Total loan costs";
+    estimate_dollar = 1178;      p_value = 0.0001;
+    ci_lo_dollar = 596;          ci_hi_dollar = 1757;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig***", "n.s.");
+    n_protected = 60;            output;
+
+    comparison="HISP_vs_WHITE";  outcome="Total loan costs";
+    estimate_dollar = 1081;      p_value = 0.0001;
+    ci_lo_dollar = 530;          ci_hi_dollar = 1631;
+    sig_05 = (p_value < 0.05);   sig_label = ifc(sig_05, "Sig***", "n.s.");
+    n_protected = 67;            output;
+
+run;
+
+/*-----------------------------------------------------------------------------
+  STEP 2: HEADLINE BLACK-WHITE COMPARISON TABLE FOR MEMO
+-----------------------------------------------------------------------------*/
+proc print data=out.four_method_summary noobs label;
+    title "FOUR-METHOD COMPARISON: Black-White Total Loan Cost Disparity";
+    title2 "ESL FCU 2024 HMDA - Methodological Triangulation";
+    where comparison = "BLACK_vs_WHITE" and outcome = "Total loan costs";
+    var method estimate_dollar ci_lo_dollar ci_hi_dollar
+        p_value sig_label n_protected sample_desc;
+    label method="Method"
+          estimate_dollar="Point Est ($)"
+          ci_lo_dollar="CI lo ($)"
+          ci_hi_dollar="CI hi ($)"
+          p_value="p-value"
+          sig_label="Sig"
+          n_protected="N Black"
+          sample_desc="Sample";
+    format estimate_dollar ci_lo_dollar ci_hi_dollar dollar10.0
+           p_value pvalue6.4;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 3: HISPANIC-WHITE COMPARISON
+-----------------------------------------------------------------------------*/
+proc print data=out.four_method_summary noobs label;
+    title "FOUR-METHOD COMPARISON: Hispanic-White Total Loan Cost Disparity";
+    where comparison = "HISP_vs_WHITE" and outcome = "Total loan costs";
+    var method estimate_dollar ci_lo_dollar ci_hi_dollar
+        p_value sig_label n_protected sample_desc;
+    label method="Method"
+          estimate_dollar="Point Est ($)"
+          ci_lo_dollar="CI lo ($)"
+          ci_hi_dollar="CI hi ($)"
+          p_value="p-value"
+          sig_label="Sig"
+          n_protected="N Hispanic"
+          sample_desc="Sample";
+    format estimate_dollar ci_lo_dollar ci_hi_dollar dollar10.0
+           p_value pvalue6.4;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 4: ORIGINATION CHARGES SUB-COMPARISON
+  (PSM/IPW only - prior chat's smoking-gun finding)
+-----------------------------------------------------------------------------*/
+proc print data=out.four_method_summary noobs label;
+    title "ORIGINATION CHARGES (Discretionary Lender Fees) - PSM/IPW Only";
+    title2 "Prior analysis isolated origination charges as the disparity driver";
+    where outcome = "Origination charges";
+    var method comparison estimate_dollar p_value sig_label n_protected;
+    format estimate_dollar dollar10.0 p_value pvalue6.4;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 5: SUMMARY STATISTICS - RANGE OF ESTIMATES
+-----------------------------------------------------------------------------*/
+proc sql;
+    title "Range of estimates across methods (Total Loan Costs)";
+    select comparison,
+           count(*)                  as n_methods,
+           min(estimate_dollar)      as min_est format=dollar10.0,
+           max(estimate_dollar)      as max_est format=dollar10.0,
+           median(estimate_dollar)   as median_est format=dollar10.0,
+           mean(estimate_dollar)     as mean_est format=dollar10.0,
+           sum(case when sig_05=1 then 1 else 0 end) as n_sig_methods
+    from out.four_method_summary
+    where outcome = "Total loan costs"
+    group by comparison;
+quit;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 6: HEADLINE LOG DUMP - the consolidated story
+-----------------------------------------------------------------------------*/
+%put ;
+%put =================================================================;
+%put ESL FCU FAIR LENDING - FOUR-METHOD METHODOLOGICAL TRIANGULATION;
+%put =================================================================;
+%put ;
+%put BLACK vs WHITE Total Loan Cost Disparity (per loan):;
+%put   1. PSM-GLM:                $917  (p=0.043)   *  Sig;
+%put   2. IPW Doubly-Robust:      $1,109 (p=0.004)  ** Sig;
+%put   3. Geographic Peer:        ~$2,540 (CI excl 0)  Directional;
+%put   4a. Oaxaca-Blinder Full:   $963  (point est);
+%put   4b. Oaxaca NoLoanAmt:      $1,701 (point est);
+%put   5a. Mixed-Effects Full:    $702  (p=0.0023)  ** Sig;
+%put   5b. Mixed-Effects NoLnAmt: $1,178 (p=0.0001) *** Sig;
+%put ;
+%put RANGE: $702 - $2,540 across all five specifications;
+%put SIG AT P less 0.05: 4 of 7 specifications (PSM, IPW, both Mixed-Effects);
+%put DIRECTION: Adverse to Black borrowers in ALL specifications;
+%put ;
+%put HISPANIC vs WHITE Total Loan Cost Disparity:;
+%put   1. PSM-GLM:                $1,214 (p=0.003)  ** Sig;
+%put   2. IPW Doubly-Robust:      $1,203 (p less 0.001) *** Sig;
+%put   3. Geographic Peer:        $1,294 (CI incl 0)   Suggestive;
+%put   4a. Oaxaca-Blinder Full:   $634  (point est);
+%put   4b. Oaxaca NoLoanAmt:      $1,414 (point est);
+%put   5a. Mixed-Effects Full:    $520  (p=0.0183)  *  Sig;
+%put   5b. Mixed-Effects NoLnAmt: $1,081 (p=0.0001) *** Sig;
+%put ;
+%put PRIOR ANALYSIS - ORIGINATION CHARGES (the actionable driver);
+%put   Black PSM-GLM:    $738  (p=0.007)  ** Sig;
+%put   Black IPW DR:     $1,375 (p less 0.001) *** Sig;
+%put   Hispanic PSM-GLM: $787  (p=0.002)  ** Sig;
+%put   Hispanic IPW DR:  $1,032 (p less 0.001) *** Sig;
+%put =================================================================;
+
+/*=============================================================================
+  END
+=============================================================================*/
