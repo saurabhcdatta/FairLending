@@ -1,0 +1,383 @@
+/*=============================================================================
+  PROGRAM:    esl_geographic_peer_framework.sas
+  PURPOSE:    Geographic-similarity peer selection + FFIEC tract enrichment
+              for ESL FCU (join_number=26241) fair lending analysis, 2024 HMDA
+  AUTHOR:     [Saurabh]
+  DATE:       2026-05-06
+
+  STRUCTURE:
+    MODULE 0 - Setup, libnames, parameters
+    MODULE 1 - ESL tract footprint construction
+    MODULE 2 - Candidate peer CU universe (filters, activity floor)
+    MODULE 3 - ESL-weighted tract overlap scoring
+    MODULE 4 - Peer selection (top-N by overlap score)
+    MODULE 5 - FFIEC Census Flat File import
+    MODULE 6 - Tract-level enrichment merge onto loan-level data
+    MODULE 7 - Diagnostics & QC
+
+  INTEGRATES WITH: existing SUR pipeline (proc syslin, 4 endogenous outcomes,
+                   residual decomposition, threshold-based anomaly flagging).
+                   Output dataset HMDA24.ESL_PEERS_GEO_ENRICHED is the input
+                   to that pipeline.
+
+  KEY DESIGN CHOICES (confirmed):
+    - Overlap metric: ESL-weighted asymmetric (Sum ESL vol in shared tracts /
+                      ESL total vol)
+    - Peer universe: Credit unions only
+    - Activity floor: >=250 originations in 2024
+    - Tract key: 11-digit character census_tract (state+county+tract)
+=============================================================================*/
+
+/*-----------------------------------------------------------------------------
+  MODULE 0: SETUP
+-----------------------------------------------------------------------------*/
+options nofmterr mprint mlogic symbolgen=0 source notes;
+
+libname hmda24  "S:\Projects\OCFP_Fair_Lending\2024_NEW\data";
+libname ffiec   "S:\Projects\OCFP_Fair_Lending\2024_NEW\data\ffiec";  /* adjust if needed */
+libname work_o  "S:\Projects\OCFP_Fair_Lending\2024_NEW\data\peer_geo"; /* output staging */
+
+%let ESL_ID            = 26241;             /* ESL FCU join_number */
+%let SOURCE_DS         = hmda24.reg_combinations_origs6;
+%let MIN_PEER_ORIGS    = 250;                /* activity floor */
+%let TOP_N_PEERS       = 25;                 /* peers retained for SUR */
+%let MIN_OVERLAP_SCORE = 0.05;               /* peer must cover >=5% of ESL vol */
+%let MIN_PEER_VOL_TR   = 3;                  /* peer needs >=3 origs in shared tract to count */
+
+/* QC switches */
+%let RUN_DIAGNOSTICS   = Y;
+%let WRITE_PEER_LIST   = Y;
+
+/*-----------------------------------------------------------------------------
+  MODULE 1: ESL TRACT FOOTPRINT
+  Build ESL's origination distribution across census tracts. This is the
+  reference distribution against which peers are scored.
+-----------------------------------------------------------------------------*/
+
+/* Pull ESL originations only */
+data work.esl_origs;
+    set &SOURCE_DS.;
+    where join_number = &ESL_ID.
+      and action_taken = 1                  /* originated only */
+      and not missing(census_tract);
+    /* normalize tract key just in case */
+    length tract_key $11;
+    tract_key = put(input(census_tract, ?? best12.), z11.);
+    if tract_key in ('00000000000','.') then delete;
+run;
+
+/* ESL volume per tract */
+proc sql;
+    create table work.esl_tract_dist as
+    select tract_key,
+           count(*)                              as esl_n_loans,
+           sum(loan_amount)                      as esl_vol,
+           calculated esl_vol /
+               (select sum(loan_amount) from work.esl_origs)
+                                                 as esl_vol_share format=percent8.2
+    from work.esl_origs
+    group by tract_key
+    order by esl_vol desc;
+quit;
+
+/* Total ESL volume - used as denominator for weighted overlap */
+proc sql noprint;
+    select sum(loan_amount) into :esl_total_vol trimmed
+    from work.esl_origs;
+    select count(distinct tract_key) into :esl_n_tracts trimmed
+    from work.esl_origs;
+quit;
+
+%put NOTE: ESL total origination volume = &esl_total_vol;
+%put NOTE: ESL active in &esl_n_tracts distinct tracts;
+
+/*-----------------------------------------------------------------------------
+  MODULE 2: CANDIDATE PEER CU UNIVERSE
+  Pull all CU originations excluding ESL, apply activity floor.
+  NOTE: assumes a flag/variable identifying credit unions. Common HMDA
+  practice: lei_type or institution_type, or a CU crosswalk by lei.
+  Adjust the WHERE clause if your dataset uses a different CU indicator.
+-----------------------------------------------------------------------------*/
+
+data work.cu_origs;
+    set &SOURCE_DS.;
+    where action_taken = 1
+      and join_number ne &ESL_ID.
+      and not missing(census_tract)
+      and not missing(join_number)
+      /* CU filter - ADJUST TO YOUR SCHEMA: */
+      and institution_type in ('CU','Credit Union')   /* <-- verify variable name */
+    ;
+    length tract_key $11;
+    tract_key = put(input(census_tract, ?? best12.), z11.);
+    if tract_key in ('00000000000','.') then delete;
+run;
+
+/* Activity floor: peer must have >=MIN_PEER_ORIGS total 2024 originations */
+proc sql;
+    create table work.cu_eligible as
+    select join_number,
+           count(*)         as peer_total_origs,
+           sum(loan_amount) as peer_total_vol
+    from work.cu_origs
+    group by join_number
+    having calculated peer_total_origs >= &MIN_PEER_ORIGS.;
+quit;
+
+proc sql noprint;
+    select count(*) into :n_eligible_cus trimmed from work.cu_eligible;
+quit;
+%put NOTE: &n_eligible_cus CUs pass the >=&MIN_PEER_ORIGS origination floor;
+
+/* Restrict candidate origs to eligible CUs */
+proc sql;
+    create table work.cand_origs as
+    select a.*
+    from work.cu_origs a
+    inner join work.cu_eligible b
+      on a.join_number = b.join_number;
+quit;
+
+/*-----------------------------------------------------------------------------
+  MODULE 3: ESL-WEIGHTED TRACT OVERLAP SCORING
+  For each candidate CU:
+    overlap_score = sum over shared tracts of (ESL_vol_in_tract)
+                    --------------------------------------------------
+                    ESL_total_vol
+
+  Interpretation: "What share of ESL's 2024 lending volume occurred in
+  tracts where this peer also has meaningful presence?"
+
+  A peer must have >= MIN_PEER_VOL_TR loans in a tract for it to count
+  as "shared" (avoids picking up trivial overlap).
+-----------------------------------------------------------------------------*/
+
+/* Peer presence per tract, with floor */
+proc sql;
+    create table work.peer_tract_pres as
+    select join_number,
+           tract_key,
+           count(*)         as peer_n_loans,
+           sum(loan_amount) as peer_vol_tract
+    from work.cand_origs
+    group by join_number, tract_key
+    having calculated peer_n_loans >= &MIN_PEER_VOL_TR.;
+quit;
+
+/* Join peers to ESL footprint on tract; sum ESL volume in shared tracts */
+proc sql;
+    create table work.peer_overlap_raw as
+    select p.join_number,
+           count(distinct p.tract_key)            as n_shared_tracts,
+           sum(e.esl_vol)                         as esl_vol_covered,
+           sum(p.peer_vol_tract)                  as peer_vol_in_shared,
+           sum(p.peer_n_loans)                    as peer_n_in_shared
+    from work.peer_tract_pres p
+    inner join work.esl_tract_dist e
+      on p.tract_key = e.tract_key
+    group by p.join_number;
+quit;
+
+/* Compute weighted overlap score and add peer totals back */
+proc sql;
+    create table work.peer_scored as
+    select r.join_number,
+           r.n_shared_tracts,
+           r.esl_vol_covered,
+           r.esl_vol_covered / &esl_total_vol.      as overlap_score format=percent8.2,
+           r.peer_n_in_shared,
+           r.peer_vol_in_shared,
+           e.peer_total_origs,
+           e.peer_total_vol,
+           r.peer_n_in_shared / e.peer_total_origs  as peer_concentration
+                                                    format=percent8.2  /* how much of peer's
+                                                       book is in ESL tracts */
+    from work.peer_overlap_raw r
+    inner join work.cu_eligible e
+      on r.join_number = e.join_number
+    order by overlap_score desc;
+quit;
+
+/*-----------------------------------------------------------------------------
+  MODULE 4: PEER SELECTION
+  Apply minimum overlap threshold, take top-N by score.
+-----------------------------------------------------------------------------*/
+
+data work.peers_selected;
+    set work.peer_scored;
+    where overlap_score >= &MIN_OVERLAP_SCORE.;
+    rank_overlap = _N_;
+    if rank_overlap <= &TOP_N_PEERS.;
+run;
+
+%if &WRITE_PEER_LIST. = Y %then %do;
+    proc print data=work.peers_selected noobs label;
+        title "Selected Peer CUs - ESL Tract-Overlap Method";
+        title2 "ESL_ID=&ESL_ID., Top &TOP_N_PEERS., Min Overlap=&MIN_OVERLAP_SCORE.";
+        var rank_overlap join_number overlap_score n_shared_tracts
+            esl_vol_covered peer_total_origs peer_total_vol peer_concentration;
+        format esl_vol_covered peer_total_vol dollar18.;
+    run;
+    title;
+%end;
+
+/* Final peer-set loan-level data: ESL + selected peers */
+proc sql;
+    create table work_o.esl_peer_loans as
+    select a.*,
+           case when a.join_number = &ESL_ID. then 1 else 0 end as is_esl,
+           coalesce(b.overlap_score, 1)        as overlap_score,
+           coalesce(b.rank_overlap, 0)         as rank_overlap
+    from &SOURCE_DS. a
+    left join work.peers_selected b
+      on a.join_number = b.join_number
+    where a.action_taken = 1
+      and (a.join_number = &ESL_ID. or b.join_number is not null);
+quit;
+
+/*-----------------------------------------------------------------------------
+  MODULE 5: FFIEC CENSUS FLAT FILE IMPORT
+  2024 FFIEC Census file. Source: https://www.ffiec.gov/censusapp.htm
+  File is fixed-width or pipe-delimited depending on year; the 2024 release
+  is pipe-delimited "CensusFlatFile2024.txt".
+
+  Key fields we need:
+    - State, County, Tract  -> build 11-digit tract_key
+    - Tract MFI %           -> "Tract Median Family Income %" (vs MSA/MD)
+    - Tract Minority %      -> "Tract Minority Population %"
+    - LMI flag derivable from MFI % (<80% = LMI)
+
+  COMMENT OUT this whole import block if FFIEC is already staged as
+  ffiec.census_2024 with the columns listed below.
+-----------------------------------------------------------------------------*/
+
+/* --- BEGIN OPTIONAL IMPORT --- */
+%macro import_ffiec;
+%if %sysfunc(exist(ffiec.census_2024)) = 0 %then %do;
+
+    filename ffraw "S:\Projects\OCFP_Fair_Lending\2024_NEW\data\ffiec\CensusFlatFile2024.txt";
+
+    /* The FFIEC layout has ~1100 columns. We pull only what's needed.
+       Column positions per the 2024 File Format Documentation:
+         col  1 : Year (4 char)
+         col 12 : State code (2 char)
+         col 13 : County code (3 char)
+         col 14 : Tract code (6 char, includes implied decimal)
+         col 19 : Tract MFI % (numeric, 6.2)
+         col 23 : Tract Minority Pop % (numeric, 6.2)
+         col 26 : Tract Median Family Income (dollar)
+         col 30 : MSA/MD Median Family Income (dollar)
+       VERIFY POSITIONS against the 2024 file format spec before running.
+    */
+    data ffiec.census_2024;
+        infile ffraw dlm='|' dsd lrecl=32767 truncover firstobs=1;
+        length state_fips $2 county_fips $3 tract_code $6
+               tract_key  $11;
+        input
+            year_yyyy            : $4.
+            @12 state_fips       : $2.
+            @13 county_fips      : $3.
+            @14 tract_code       : $6.
+            @19 tract_mfi_pct    : best12.
+            @23 tract_minority_pct : best12.
+            @26 tract_mfi_dollar : best12.
+            @30 msa_mfi_dollar   : best12.
+        ;
+        tract_key = cats(state_fips, county_fips, tract_code);
+        /* LMI flag per FFIEC standard: <80% of MSA/MD MFI */
+        if not missing(tract_mfi_pct) then
+            lmi_flag = (tract_mfi_pct < 80);
+        /* Minority-majority tract flag (>=50%) for fair lending overlay */
+        if not missing(tract_minority_pct) then
+            min_majority_flag = (tract_minority_pct >= 50);
+        label
+            tract_mfi_pct       = "Tract MFI as % of MSA/MD"
+            tract_minority_pct  = "Tract Minority Population %"
+            lmi_flag            = "Low-Mod Income tract (MFI<80%)"
+            min_majority_flag   = "Minority-majority tract (>=50%)";
+    run;
+
+%end;
+%else %do;
+    %put NOTE: ffiec.census_2024 already exists - skipping import.;
+%end;
+%mend import_ffiec;
+
+%import_ffiec;
+/* --- END OPTIONAL IMPORT --- */
+
+/*-----------------------------------------------------------------------------
+  MODULE 6: TRACT-LEVEL ENRICHMENT MERGE
+  Attach tract MFI %, minority %, LMI flag, minority-majority flag to each
+  loan in the ESL+peers dataset. This produces the dataset that feeds
+  the stratified SUR.
+-----------------------------------------------------------------------------*/
+
+proc sql;
+    create table hmda24.esl_peers_geo_enriched as
+    select a.*,
+           f.tract_mfi_pct,
+           f.tract_minority_pct,
+           f.lmi_flag,
+           f.min_majority_flag,
+           f.tract_mfi_dollar,
+           f.msa_mfi_dollar
+    from work_o.esl_peer_loans a
+    left join ffiec.census_2024 f
+      on put(input(a.census_tract, ?? best12.), z11.) = f.tract_key;
+quit;
+
+/*-----------------------------------------------------------------------------
+  MODULE 7: DIAGNOSTICS & QC
+-----------------------------------------------------------------------------*/
+%if &RUN_DIAGNOSTICS. = Y %then %do;
+
+    /* 7a: Match rate for FFIEC merge */
+    proc sql;
+        title "FFIEC Merge Match Rate";
+        select sum(case when not missing(tract_minority_pct) then 1 else 0 end)
+                  / count(*) as ffiec_match_rate format=percent8.2,
+               count(*)      as n_loans
+        from hmda24.esl_peers_geo_enriched;
+    quit;
+
+    /* 7b: ESL vs peers - distribution across minority-density buckets */
+    proc format;
+        value mindensf
+            low - <10  = '1: <10%'
+            10 - <30   = '2: 10-30%'
+            30 - <50   = '3: 30-50%'
+            50 - high  = '4: 50%+';
+    run;
+
+    proc freq data=hmda24.esl_peers_geo_enriched;
+        title "Loan distribution by tract minority density: ESL vs Peers";
+        tables is_esl * tract_minority_pct / nocol nopercent missing;
+        format tract_minority_pct mindensf.;
+    run;
+
+    /* 7c: Pre-registered hypothesis check - does tract-min density correlate
+       with origination charges (Loan_Cost_Prc_LA) more than rates
+       (Interest_Rate_Min_PMMS_1)?  Quick correlation pass before SUR. */
+    proc corr data=hmda24.esl_peers_geo_enriched nosimple;
+        title "Tract minority % vs outcomes - pre-SUR sanity check";
+        var tract_minority_pct;
+        with Interest_Rate_Min_PMMS_1 Discount_Points_LA
+             Lender_Credits_LA Loan_Cost_Prc_LA;
+    run;
+
+    /* 7d: Peer concentration sanity - any one peer dominating? */
+    proc freq data=hmda24.esl_peers_geo_enriched;
+        title "Loan counts by institution in final peer set";
+        tables join_number / out=work.peer_loan_counts;
+    run;
+
+    title;
+%end;
+
+/*=============================================================================
+  END OF PROGRAM
+  Output: hmda24.esl_peers_geo_enriched
+  Next:   feed into SUR pipeline (proc syslin) with tract_minority_pct,
+          tract_mfi_pct, lmi_flag as additional controls or stratifiers.
+=============================================================================*/
