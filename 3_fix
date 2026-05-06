@@ -1,0 +1,61 @@
+/* ============================================================
+   PART 1: FIX BOOTSTRAP MERGE
+   ============================================================ */
+
+/* Check if bootstrap rows exist */
+proc sql noprint;
+  select count(*) into :boot_count
+  from summary_all where method = 'Adj_Bootstrap';
+quit;
+
+%put NOTE: Bootstrap rows in summary_all = &boot_count;
+
+/* If 0, the bootstrap output never appended. Check raw bootstrap results: */
+proc print data=all_bootstrap_results (obs=10);
+  title "Raw Bootstrap Results";
+run;
+
+/* If outcome casing mismatched, fix and re-run convergence: */
+data summary_all_fixed;
+  set summary_all;
+  /* Standardize outcome casing */
+  outcome = strip(outcome);
+  if upcase(outcome) = upcase('Discount_Points_LA') 
+    then outcome = 'Discount_Points_LA';
+  if upcase(outcome) = upcase('Lender_Credits_LA')
+    then outcome = 'Lender_Credits_LA';
+  if upcase(outcome) = upcase('Loan_Cost_Prc_LA')
+    then outcome = 'Loan_Cost_Prc_LA';
+  if upcase(outcome) = upcase('all_in_cost')
+    then outcome = 'all_in_cost';
+  if upcase(outcome) = upcase('numeric_rate')
+    then outcome = 'numeric_rate';
+run;
+
+/* Rebuild convergence with fixed data */
+proc sql;
+  create table convergence_v2 as
+  select
+    group,
+    outcome,
+    sum(case when finding contains 'ADVERSE' then 1 else 0 end)
+      as n_adverse,
+    sum(case when finding = 'Favorable to minority' then 1 else 0 end)
+      as n_favorable,
+    count(*) as n_methods,
+    case
+      when calculated n_adverse = 3 then '*** ROBUST ADVERSE'
+      when calculated n_adverse = 2 then '** LIKELY ADVERSE'
+      when calculated n_adverse = 1 then 'SINGLE-METHOD FLAG'
+      when calculated n_favorable = 3 then 'ROBUST FAVORABLE'
+      else 'NO DISPARITY'
+    end as convergence_finding length=25
+  from summary_all_fixed
+  where method in ('PSM_GLM' 'IPW_DR' 'Adj_Bootstrap')
+  group by group, outcome
+  order by group, outcome;
+quit;
+
+proc print data=convergence_v2 noobs;
+  title "Convergence V2 - All 3 Methods";
+run;
