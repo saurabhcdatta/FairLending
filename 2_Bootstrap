@@ -1,7 +1,8 @@
 /* ============================================================
-   FEE DECOMPOSITION ANALYSIS
-   Identify which specific fee components drive the
-   adverse Loan_Cost_Prc disparity for Black and Hispanic
+   FEE DECOMPOSITION - REVISED
+   Tests: orig_charges, tot_loan_costs, and their DIFFERENCE
+          (which represents non-origination fees: title,
+           appraisal, third-party, etc.)
    ============================================================ */
 
 %let path = S:\Projects\OCFP_Fair_Lending\2024_NEW\data;
@@ -10,28 +11,26 @@ libname hmda24 "&path";
 options nonotes nosource errors=0;
 
 /* ============================================================
-   STEP 1: CONVERT CHAR FEE VARIABLES TO NUMERIC + RATIOS
+   STEP 1: BUILD CLEAN DECOMPOSITION DATASET
    ============================================================ */
 
 data hmda_fees;
   set hmda24.eslfcu;
 
-  /* Convert character fees to numeric 
-     "Exempt", "NA", missing all become . */
-  loan_cost_num         = input(loan_cost, ?? best12.);
-  orig_charges_num      = input(orig_charges, ?? best12.);
-  origination_charge_num = input(origination_charge, ?? best12.);
-  tot_ln_costs_num      = input(tot_ln_costs, ?? best12.);
-  tot_points_fees_num   = input(tot_points_fees, ?? best12.);
+  /* Convert character fees to numeric */
+  orig_charges_num    = input(orig_charges, ?? best12.);
+  tot_ln_costs_num    = input(tot_ln_costs, ?? best12.);
 
-  /* Build percentage versions (fee / loan amount) for fair comparison
-     This matches the convention of Loan_Cost_Prc_LA */
+  /* Build the decomposition:
+     Total loan costs = Origination charges + Non-origination fees */
+  if not missing(tot_ln_costs_num) and not missing(orig_charges_num)
+    then non_orig_fees_num = tot_ln_costs_num - orig_charges_num;
+
+  /* Build percentage versions */
   if loan_amt > 0 then do;
-    orig_charges_pct      = orig_charges_num      / loan_amt;
-    origination_chg_pct   = origination_charge_num / loan_amt;
-    tot_ln_costs_pct      = tot_ln_costs_num      / loan_amt;
-    tot_points_fees_pct   = tot_points_fees_num   / loan_amt;
-    loan_cost_pct         = loan_cost_num         / loan_amt;
+    orig_charges_pct    = orig_charges_num    / loan_amt;
+    tot_ln_costs_pct    = tot_ln_costs_num    / loan_amt;
+    non_orig_fees_pct   = non_orig_fees_num   / loan_amt;
   end;
 
   /* Race keep flags */
@@ -40,18 +39,21 @@ data hmda_fees;
   keep_aw = (asian=1 or white=1);
 run;
 
-/* Quick check on data quality */
+/* Verify the decomposition is sensible */
 proc means data=hmda_fees n nmiss mean median min max;
-  var loan_cost_num orig_charges_num origination_charge_num
-      tot_ln_costs_num tot_points_fees_num
-      orig_charges_pct origination_chg_pct
-      tot_ln_costs_pct tot_points_fees_pct;
-  title "Fee Variables - Data Quality Check";
+  var orig_charges_pct non_orig_fees_pct tot_ln_costs_pct;
+  title "Decomposition Check - Components Should Sum to Total";
+run;
+
+/* Show breakdown by race for context */
+proc means data=hmda_fees mean;
+  class black hisp asian white;
+  var orig_charges_pct non_orig_fees_pct tot_ln_costs_pct;
+  title "Average Fee Components by Race";
 run;
 
 /* ============================================================
    STEP 2: DECOMPOSITION MACRO
-   Same PSM-GLM and IPW pipeline, but on each fee component
    ============================================================ */
 
 %macro decompose_fees(
@@ -68,7 +70,7 @@ run;
     treated = &group;
   run;
 
-  /* PS Model (same as before) */
+  /* PS Model */
   proc logistic data=fee_analysis_&group desc noprint;
     weight loan_Amt;
     model treated =
@@ -99,7 +101,7 @@ run;
     output out = fee_matched_&group;
   run;
 
-  /* IPW Dataset */
+  /* IPW */
   proc sql noprint;
     select count(*) into :n_treated trimmed
     from fee_analysis_&group where treated=1;
@@ -115,15 +117,17 @@ run;
     if sipw > 10 then sipw = 10;
   run;
 
-  /* Loop over fee components */
-  %let fee_outcomes = orig_charges_pct origination_chg_pct
-                      tot_ln_costs_pct tot_points_fees_pct;
+  /* Loop over THREE outcomes:
+     1. orig_charges_pct  - lender's pricing discretion
+     2. non_orig_fees_pct - third-party / other fees
+     3. tot_ln_costs_pct  - the umbrella metric (sanity check) */
+  %let fee_outcomes = orig_charges_pct non_orig_fees_pct tot_ln_costs_pct;
   %let i = 1;
 
   %do %while (%scan(&fee_outcomes, &i) ne );
     %let var = %scan(&fee_outcomes, &i);
 
-    /* GLM on matched */
+    /* GLM */
     ods output ParameterEstimates = fee_glm_&group._&i;
 
     proc glm data=fee_matched_&group;
@@ -195,15 +199,15 @@ run;
 
   data fee_results_&group;
     set fee_glm_result_&group._1 fee_glm_result_&group._2
-        fee_glm_result_&group._3 fee_glm_result_&group._4
+        fee_glm_result_&group._3
         fee_ipw_result_&group._1 fee_ipw_result_&group._2
-        fee_ipw_result_&group._3 fee_ipw_result_&group._4;
+        fee_ipw_result_&group._3;
   run;
 
 %mend decompose_fees;
 
 /* ============================================================
-   STEP 3: RUN FOR ALL THREE GROUPS
+   STEP 3: RUN ALL THREE GROUPS
    ============================================================ */
 
 %decompose_fees(group=black, label=Black,    keepvar=keep_bw);
@@ -211,7 +215,7 @@ run;
 %decompose_fees(group=asian, label=Asian,    keepvar=keep_aw);
 
 /* ============================================================
-   STEP 4: COMBINE AND FLAG FINDINGS
+   STEP 4: COMBINE AND FLAG
    ============================================================ */
 
 data all_fee_decomp;
@@ -220,7 +224,6 @@ data all_fee_decomp;
       fee_results_asian;
   length finding $30;
 
-  /* For all fee components, HIGHER = adverse */
   if pvalue ne . and pvalue < 0.05 and disparity_pct > 0
     then finding = "*** ADVERSE - SIGNIFICANT";
   else if pvalue ne . and pvalue < 0.10 and disparity_pct > 0
@@ -234,14 +237,11 @@ proc sort data=all_fee_decomp;
   by group fee_component method;
 run;
 
-/* ============================================================
-   STEP 5: RESTORE LOG AND PRINT REPORTS
-   ============================================================ */
-
 options notes source;
 
+/* Master detail */
 proc print data=all_fee_decomp noobs label;
-  title "FEE DECOMPOSITION - Which Fees Drive the Disparity?";
+  title "FEE DECOMPOSITION - Origination vs. Non-Origination Fees";
   by group;
   id group;
   var fee_component method disparity_pct std_err
@@ -250,25 +250,11 @@ proc print data=all_fee_decomp noobs label;
          pvalue 6.4
          dollar_300k dollar10.2;
   label fee_component = "Fee Component"
-        method = "Method"
         disparity_pct = "Disparity (%)"
-        std_err = "Std Error"
-        pvalue = "P-Value"
-        dollar_300k = "$ on $300K Loan"
-        finding = "Interpretation";
+        dollar_300k = "$ on $300K Loan";
 run;
 
-/* Adverse fee findings only */
-proc print data=all_fee_decomp noobs label;
-  where finding contains 'ADVERSE';
-  title "FLAGGED ADVERSE FEE COMPONENTS";
-  var group fee_component method disparity_pct
-      pvalue dollar_300k finding;
-  format disparity_pct 12.6 pvalue 6.4
-         dollar_300k dollar10.2;
-run;
-
-/* Method convergence on fees */
+/* Convergence */
 proc sql;
   create table fee_convergence as
   select
@@ -276,31 +262,36 @@ proc sql;
     fee_component,
     sum(case when finding contains 'ADVERSE' then 1 else 0 end)
       as n_adverse,
-    count(*) as n_methods,
     case
       when calculated n_adverse = 2 then '** BOTH METHODS ADVERSE'
       when calculated n_adverse = 1 then 'SINGLE-METHOD FLAG'
       else 'NO DISPARITY'
     end as convergence length=25
   from all_fee_decomp
-  group by group, fee_component
-  order by group, fee_component;
+  group by group, fee_component;
 quit;
 
 proc print data=fee_convergence noobs;
-  title "FEE COMPONENT - METHOD CONVERGENCE";
+  title "FEE COMPONENT CONVERGENCE";
 run;
 
-/* ============================================================
-   STEP 6: EXPORT TO EXCEL
-   ============================================================ */
+/* Adverse only */
+proc print data=all_fee_decomp noobs label;
+  where finding contains 'ADVERSE';
+  title "ADVERSE FEE COMPONENTS";
+  var group fee_component method disparity_pct
+      pvalue dollar_300k finding;
+  format disparity_pct 12.6 pvalue 6.4
+         dollar_300k dollar10.2;
+run;
 
+/* Excel */
 ods excel file="&path\Fee_Decomposition_2024.xlsx"
           options(embedded_titles="yes");
 
 ods excel options(sheet_name="Full Detail");
 proc print data=all_fee_decomp noobs label;
-  title "Fee Decomposition - All Components, Both Methods";
+  title "Fee Decomposition";
   var group fee_component method disparity_pct std_err
       pvalue dollar_300k finding;
   format disparity_pct std_err 12.6 pvalue 6.4
@@ -318,9 +309,6 @@ run;
 
 ods excel options(sheet_name="Convergence");
 proc print data=fee_convergence noobs;
-  title "Method Convergence by Fee Component";
 run;
 
 ods excel close;
-
-%put NOTE: Fee decomposition complete. Output: &path\Fee_Decomposition_2024.xlsx;
