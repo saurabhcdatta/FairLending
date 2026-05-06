@@ -1,19 +1,19 @@
-/* Diagnostic: full peer_scored distribution before threshold filtering */
-proc univariate data=work.peer_scored;
-    var overlap_score n_shared_tracts peer_total_origs peer_concentration;
+proc means data=work.analy_loans n nmiss mean median min max;
+    var Interest_Rate_Min_PMMS_1 Discount_Points_LA 
+        Lender_Credits_LA Loan_Cost_Prc_LA;
+    class role;
 run;
 
-proc print data=work.peer_scored (obs=30);
-    title "Top 30 peers by overlap_score - pre-threshold";
-    var join_number overlap_score n_shared_tracts peer_total_origs peer_concentration;
-run;
-
-/* And: how many CUs were even in the candidate pool? */
+/* And check what fraction are actual zeros vs missing */
 proc sql;
-    select count(*) as n_eligible_cus from work.cu_eligible;
+    select role,
+           sum(Discount_Points_LA = 0)         as zeros_disc,
+           sum(missing(Discount_Points_LA))    as miss_disc,
+           sum(Lender_Credits_LA = 0)          as zeros_cred,
+           sum(missing(Lender_Credits_LA))     as miss_cred,
+           sum(Loan_Cost_Prc_LA = 0)           as zeros_cost,
+           sum(missing(Loan_Cost_Prc_LA))      as miss_cost,
+           count(*)                            as n_total
+    from work.analy_loans
+    group by role;
 quit;
-
-/* What's the geographic distribution of ESL's volume? */
-proc print data=work.esl_tract_dist (obs=20);
-    title "ESL top 20 tracts by volume";
-run;
