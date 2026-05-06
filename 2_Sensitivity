@@ -1,267 +1,451 @@
 /*=============================================================================
-  PROGRAM:    esl_peer_sensitivity_analysis.sas
-  PURPOSE:    Sensitivity analysis across 3 parameter regimes for ESL peer
-              selection. Reuses Modules 1-2 outputs from the main framework
-              (work.esl_tract_dist, work.cu_origs, work.esl_origs). Re-runs
-              Modules 2b-4 under each regime and produces side-by-side
-              comparison plus separate output datasets.
+  PROGRAM:    esl_descriptive_pricing_comparison.sas
+  PURPOSE:    Tract-level descriptive pricing comparison: ESL vs. pooled
+              equal-weighted CU peers, with cluster bootstrap CIs and
+              race-stratified decomposition for fair lending.
 
-  PRECONDITION: esl_geographic_peer_framework.sas Modules 0-2 have run, so
-                work.esl_origs, work.cu_origs, work.esl_tract_dist exist
-                in the WORK library.
+  PRECONDITION:
+    - esl_geographic_peer_framework.sas Modules 0-2 have run
+    - esl_peer_sensitivity_analysis.sas has run, producing
+      work.peers_regime_B (3 CU peers: 2399, 1849, 1389)
+    - work.esl_origs and work.cu_origs exist
 
-  REGIMES:
-    A - Aggressive: floor=50,  vol_tr=1, overlap>=0.02
-    B - Moderate:   floor=100, vol_tr=1, overlap>=0.03
-    C - Strict:     floor=250, vol_tr=1, overlap>=0.05
+  DESIGN (locked in):
+    - Pooled equal-weighted across the 3 peers within each tract
+    - Loan-level pairs within tract (every ESL loan x every peer loan)
+    - Cluster bootstrap on tract (1000 reps)
+    - 4 outcomes: Interest_Rate_Min_PMMS_1, Discount_Points_LA,
+                  Lender_Credits_LA, Loan_Cost_Prc_LA
+    - Race-stratified version: ESL borrowers split by race, compared to
+      pooled peer benchmark in same tract
 
   OUTPUTS:
-    work.peers_regime_A, work.peers_regime_B, work.peers_regime_C
-    work.regime_comparison           - one-row-per-regime summary
-    work.regime_peer_overlap         - which peers appear in which regimes
+    work.tract_cells           - tract x outcome differentials
+    work.pooled_diffs          - pooled differentials with bootstrap CIs
+    work.race_stratified_diffs - same, split by ESL borrower race
+    work.peer_diagnostics      - per-peer contribution to pool
+
+  PARAMETERS to tune:
+    SOURCE_PEER_DS - which regime's peer set (default B)
+    N_BOOT         - bootstrap reps (default 1000)
 =============================================================================*/
 
-options nofmterr mprint=0 mlogic=0 symbolgen=0;
+options nofmterr nomprint nomlogic nosymbolgen;
 
-/* Pull ESL totals into macros if not already set in environment */
+%let SOURCE_PEER_DS = work.peers_regime_B;
+%let N_BOOT         = 1000;
+%let SEED           = 20260506;
+%let ESL_ID         = 26241;
+
+/* The 4 endogenous outcomes from the SUR pipeline */
+%let OUTCOMES = Interest_Rate_Min_PMMS_1 Discount_Points_LA
+                Lender_Credits_LA       Loan_Cost_Prc_LA;
+
+/*-----------------------------------------------------------------------------
+  MODULE 1: BUILD ANALYTICAL DATASET
+  Pull all loans (ESL + 3 peers) only in tracts shared with ESL. Tag each
+  loan with role (esl vs peer) and join_number for diagnostics.
+-----------------------------------------------------------------------------*/
+
+/* Get the peer join numbers as a macro variable list */
 proc sql noprint;
-    select sum(loan_amount) into :esl_total_vol trimmed
-    from work.esl_origs;
-    select count(distinct tract_key) into :esl_n_tracts trimmed
-    from work.esl_origs;
+    select join_number into :peer_list separated by ','
+    from &SOURCE_PEER_DS.;
+    select count(*) into :n_peers trimmed from &SOURCE_PEER_DS.;
 quit;
 
-%put NOTE: ESL total volume = &esl_total_vol, distinct tracts = &esl_n_tracts;
+%put NOTE: Using &n_peers peers: &peer_list;
 
-/*-----------------------------------------------------------------------------
-  REUSABLE MACRO: run_regime
-  Encapsulates eligibility filter, overlap scoring, and selection for one
-  parameter set.
------------------------------------------------------------------------------*/
-%macro run_regime(regime=, floor=, vol_tr=, overlap=, top_n=25);
-
-    %put ==========================================================;
-    %put RUNNING REGIME &regime: floor=&floor, vol_tr=&vol_tr, overlap=&overlap;
-    %put ==========================================================;
-
-    /* Eligibility (activity floor) */
-    proc sql;
-        create table work.elig_&regime as
-        select join_number,
-               count(*)         as peer_total_origs,
-               sum(loan_amount) as peer_total_vol
+/* Identify shared tracts: tracts where ESL operates AND at least one peer has
+   >=1 loan (consistent with regime B's vol_tr=1) */
+proc sql;
+    create table work.shared_tracts as
+    select distinct e.tract_key
+    from work.esl_tract_dist e
+    inner join (
+        select distinct tract_key
         from work.cu_origs
-        group by join_number
-        having calculated peer_total_origs >= &floor.;
-    quit;
-
-    proc sql noprint;
-        select count(*) into :n_elig_&regime trimmed from work.elig_&regime;
-    quit;
-
-    /* Restrict candidate origs to eligible CUs */
-    proc sql;
-        create table work.cand_&regime as
-        select a.*
-        from work.cu_origs a
-        inner join work.elig_&regime b
-          on a.join_number = b.join_number;
-    quit;
-
-    /* Peer presence per tract with vol_tr floor */
-    proc sql;
-        create table work.pres_&regime as
-        select join_number,
-               tract_key,
-               count(*)         as peer_n_loans,
-               sum(loan_amount) as peer_vol_tract
-        from work.cand_&regime
-        group by join_number, tract_key
-        having calculated peer_n_loans >= &vol_tr.;
-    quit;
-
-    /* Compute overlap (ESL volume covered by shared tracts) */
-    proc sql;
-        create table work.raw_&regime as
-        select p.join_number,
-               count(distinct p.tract_key)            as n_shared_tracts,
-               sum(e.esl_vol)                         as esl_vol_covered,
-               sum(p.peer_vol_tract)                  as peer_vol_in_shared,
-               sum(p.peer_n_loans)                    as peer_n_in_shared
-        from work.pres_&regime p
-        inner join work.esl_tract_dist e
-          on p.tract_key = e.tract_key
-        group by p.join_number;
-    quit;
-
-    proc sql;
-        create table work.scored_&regime as
-        select r.join_number,
-               r.n_shared_tracts,
-               r.esl_vol_covered,
-               r.esl_vol_covered / &esl_total_vol.      as overlap_score
-                                                          format=percent8.2,
-               r.peer_n_in_shared,
-               r.peer_vol_in_shared,
-               e.peer_total_origs,
-               e.peer_total_vol,
-               r.peer_n_in_shared / e.peer_total_origs  as peer_concentration
-                                                          format=percent8.2
-        from work.raw_&regime r
-        inner join work.elig_&regime e
-          on r.join_number = e.join_number
-        order by overlap_score desc;
-    quit;
-
-    /* Apply overlap threshold + top-N */
-    data work.peers_regime_&regime;
-        length regime $1;
-        retain regime "&regime";
-        set work.scored_&regime;
-        where overlap_score >= &overlap.;
-        rank_overlap = _N_;
-        if rank_overlap <= &top_n.;
-    run;
-
-    /* Capture diagnostics */
-    proc sql noprint;
-        select count(*),
-               sum(case when overlap_score >= &overlap. then 1 else 0 end),
-               max(overlap_score),
-               median(overlap_score)
-        into :n_scored_&regime  trimmed,
-             :n_passed_&regime  trimmed,
-             :max_score_&regime trimmed,
-             :med_score_&regime trimmed
-        from work.scored_&regime;
-    quit;
-
-    proc sql noprint;
-        select count(*) into :n_final_&regime trimmed
-        from work.peers_regime_&regime;
-    quit;
-
-%mend run_regime;
-
-/*-----------------------------------------------------------------------------
-  EXECUTE THE THREE REGIMES
------------------------------------------------------------------------------*/
-%run_regime(regime=A, floor=50,  vol_tr=1, overlap=0.02, top_n=25);
-%run_regime(regime=B, floor=100, vol_tr=1, overlap=0.03, top_n=25);
-%run_regime(regime=C, floor=250, vol_tr=1, overlap=0.05, top_n=25);
-
-/*-----------------------------------------------------------------------------
-  SIDE-BY-SIDE COMPARISON TABLE
------------------------------------------------------------------------------*/
-data work.regime_comparison;
-    length regime $1 description $40;
-    format max_overlap median_overlap percent8.2;
-
-    regime = "A"; description = "Aggressive (floor=50, overlap>=2%)";
-    n_eligible_cus    = &n_elig_A.;
-    n_with_any_overlap = &n_scored_A.;
-    n_passed_threshold = &n_passed_A.;
-    n_final_top_n      = &n_final_A.;
-    max_overlap        = &max_score_A.;
-    median_overlap     = &med_score_A.;
-    output;
-
-    regime = "B"; description = "Moderate (floor=100, overlap>=3%)";
-    n_eligible_cus    = &n_elig_B.;
-    n_with_any_overlap = &n_scored_B.;
-    n_passed_threshold = &n_passed_B.;
-    n_final_top_n      = &n_final_B.;
-    max_overlap        = &max_score_B.;
-    median_overlap     = &med_score_B.;
-    output;
-
-    regime = "C"; description = "Strict (floor=250, overlap>=5%)";
-    n_eligible_cus    = &n_elig_C.;
-    n_with_any_overlap = &n_scored_C.;
-    n_passed_threshold = &n_passed_C.;
-    n_final_top_n      = &n_final_C.;
-    max_overlap        = &max_score_C.;
-    median_overlap     = &med_score_C.;
-    output;
-
-    label
-        n_eligible_cus     = "Eligible CUs (pass floor)"
-        n_with_any_overlap = "CUs with any tract overlap"
-        n_passed_threshold = "CUs >= overlap threshold"
-        n_final_top_n      = "Final peer count (post top-N)"
-        max_overlap        = "Max overlap score"
-        median_overlap     = "Median overlap score";
-run;
-
-proc print data=work.regime_comparison noobs label;
-    title "Sensitivity Analysis: Peer Selection Across 3 Regimes";
-    title2 "ESL FCU (join_number=26241), 2024 HMDA, CU-only universe";
-run;
-title;
-
-/*-----------------------------------------------------------------------------
-  PEER OVERLAP ACROSS REGIMES
-  Which peer CUs appear in which regimes? Identifies the stable core peer
-  set vs. peers that only appear under aggressive parameters.
------------------------------------------------------------------------------*/
-proc sql;
-    create table work.regime_peer_overlap as
-    select coalesce(a.join_number, b.join_number, c.join_number) as join_number,
-           case when a.join_number is not null then 1 else 0 end as in_A,
-           case when b.join_number is not null then 1 else 0 end as in_B,
-           case when c.join_number is not null then 1 else 0 end as in_C,
-           coalesce(a.overlap_score, b.overlap_score, c.overlap_score)
-                                                                 as best_overlap
-                                                                 format=percent8.2,
-           coalesce(a.peer_total_origs, b.peer_total_origs, c.peer_total_origs)
-                                                                 as peer_total_origs,
-           coalesce(a.n_shared_tracts, b.n_shared_tracts, c.n_shared_tracts)
-                                                                 as n_shared_tracts
-    from work.peers_regime_A a
-    full join work.peers_regime_B b on a.join_number = b.join_number
-    full join work.peers_regime_C c on coalesce(a.join_number, b.join_number)
-                                       = c.join_number
-    order by in_C desc, in_B desc, in_A desc, best_overlap desc;
+        where join_number in (&peer_list.)
+    ) p
+      on e.tract_key = p.tract_key;
 quit;
 
-proc print data=work.regime_peer_overlap noobs label;
-    title "Peer membership across regimes (1=member)";
-    title2 "Read: peers in regime C are most stable; peers only in A are most marginal";
-    var join_number in_A in_B in_C best_overlap n_shared_tracts peer_total_origs;
+proc sql noprint;
+    select count(*) into :n_shared_tracts trimmed from work.shared_tracts;
+quit;
+%put NOTE: &n_shared_tracts unique shared tracts across ESL + 3 peers;
+
+/* Pull loan-level data restricted to shared tracts, ESL + 3 peers */
+proc sql;
+    create table work.analy_loans as
+    select a.*,
+           case when a.join_number = &ESL_ID. then "ESL"
+                else "PEER" end                          as role length=4,
+           case when a.join_number = &ESL_ID. then 0
+                else a.join_number end                   as peer_id
+    from (
+        select * from work.esl_origs
+        union all corr
+        select * from work.cu_origs where join_number in (&peer_list.)
+    ) a
+    inner join work.shared_tracts s
+      on a.tract_key = s.tract_key;
+quit;
+
+/* Sanity check: how many loans per role per peer? */
+proc freq data=work.analy_loans;
+    title "Loan counts in shared tracts";
+    tables role*join_number / nopercent norow nocol;
 run;
 title;
 
-/* Quick stability check: how many peers are in all 3? Only in A? */
-proc sql;
-    title "Stability summary";
-    select sum(in_A and in_B and in_C) as in_all_three,
-           sum(in_C)                   as in_C_only_or_more,
-           sum(in_A and not in_B)      as in_A_not_B,
-           sum(in_B and not in_C)      as in_B_not_C
-    from work.regime_peer_overlap;
-quit;
-title;
-
 /*-----------------------------------------------------------------------------
-  TOP-10 LISTS PER REGIME (for visual inspection of who the peers are)
+  MODULE 2: LOAN-LEVEL PAIRS WITHIN TRACT
+  For each shared tract, every ESL loan is paired with every peer loan.
+  Compute ESL_outcome - peer_outcome at the pair level. Tract-level cell
+  value = mean of pair differentials within that tract.
+
+  IMPORTANT: pooled equal-weighted means EACH PEER contributes equally per
+  tract regardless of loan count. We achieve this by computing tract-level
+  peer means PER PEER first, then averaging across peers within tract,
+  then differencing against ESL's tract mean.
 -----------------------------------------------------------------------------*/
-%macro top10(regime);
-    proc print data=work.peers_regime_&regime (obs=10) noobs label;
-        title "Regime &regime: Top 10 peers by overlap score";
-        var rank_overlap join_number overlap_score n_shared_tracts
-            peer_total_origs peer_concentration;
-        format peer_total_origs comma10.;
-    run;
+
+/* 2a: ESL tract-level means */
+proc sql;
+    create table work.esl_tract_means as
+    select tract_key,
+           count(*) as esl_n,
+           %do_outcome_means(esl_, &OUTCOMES.)
+    from work.analy_loans
+    where role = "ESL"
+    group by tract_key;
+quit;
+
+/* The macro above doesn't exist yet - inlining the logic instead.
+   Building per-outcome means using a dynamic select list. */
+%macro tract_means_block(prefix=, role_filter=, byvar=tract_key, extra_by=);
+    proc sql;
+        create table work.&prefix.tract_means as
+        select &byvar. &extra_by., count(*) as &prefix.n,
+               mean(Interest_Rate_Min_PMMS_1) as &prefix.rate,
+               mean(Discount_Points_LA)       as &prefix.disc,
+               mean(Lender_Credits_LA)        as &prefix.cred,
+               mean(Loan_Cost_Prc_LA)         as &prefix.cost
+        from work.analy_loans
+        where &role_filter.
+        group by &byvar. &extra_by.;
+    quit;
 %mend;
 
-%top10(A);
-%top10(B);
-%top10(C);
+/* 2a (corrected): ESL means per tract */
+%tract_means_block(prefix=esl_, role_filter=%str(role="ESL"));
+
+/* 2b: Per-peer means per tract (so we can equal-weight peers) */
+%tract_means_block(prefix=peer_, role_filter=%str(role="PEER"),
+                   byvar=tract_key, extra_by=%str(, join_number));
+
+/* 2c: Equal-weighted pooled peer mean per tract */
+proc sql;
+    create table work.pool_tract_means as
+    select tract_key,
+           count(distinct join_number) as n_peers_in_tract,
+           sum(peer_n)                 as pool_n_loans,
+           mean(peer_rate)             as pool_rate,
+           mean(peer_disc)             as pool_disc,
+           mean(peer_cred)             as pool_cred,
+           mean(peer_cost)             as pool_cost
+    from work.peer_tract_means
+    group by tract_key;
+quit;
+
+/* 2d: Tract-level differentials (ESL - pooled peer) */
+proc sql;
+    create table work.tract_cells as
+    select e.tract_key,
+           e.esl_n,
+           p.n_peers_in_tract,
+           p.pool_n_loans,
+           e.esl_rate - p.pool_rate as diff_rate,
+           e.esl_disc - p.pool_disc as diff_disc,
+           e.esl_cred - p.pool_cred as diff_cred,
+           e.esl_cost - p.pool_cost as diff_cost
+    from work.esl_tract_means e
+    inner join work.pool_tract_means p
+      on e.tract_key = p.tract_key;
+quit;
+
+proc means data=work.tract_cells n mean median std min max maxdec=4;
+    title "Tract-level pricing differentials (ESL - pooled peer)";
+    var diff_rate diff_disc diff_cred diff_cost;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  MODULE 3: POOLED AGGREGATION
+  Mean of tract-level differentials = pooled differential point estimate.
+  Each tract weighted equally (one tract = one observation).
+-----------------------------------------------------------------------------*/
+
+proc sql;
+    create table work.point_estimates as
+    select count(*)         as n_tracts,
+           mean(diff_rate)  as point_diff_rate,
+           mean(diff_disc)  as point_diff_disc,
+           mean(diff_cred)  as point_diff_cred,
+           mean(diff_cost)  as point_diff_cost
+    from work.tract_cells;
+quit;
+
+proc print data=work.point_estimates noobs label;
+    title "Pooled point estimates (mean of tract-level differentials)";
+    title2 "Positive value = ESL prices HIGHER than peer pool in shared tracts";
+    label point_diff_rate = "Rate (pp)"
+          point_diff_disc = "Discount points ($)"
+          point_diff_cred = "Lender credits ($)"
+          point_diff_cost = "Total loan costs ($)";
+    format point_diff_rate 8.4
+           point_diff_disc point_diff_cred point_diff_cost dollar10.2;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  MODULE 4: CLUSTER BOOTSTRAP ON TRACT
+  Resample tracts with replacement N_BOOT times. For each replicate,
+  recompute the pooled differential. Take 2.5/97.5 percentiles for 95% CI.
+-----------------------------------------------------------------------------*/
+
+/* Generate N_BOOT bootstrap samples of tract_cells */
+proc surveyselect data=work.tract_cells
+                  out=work.boot_samples
+                  method=urs                /* unrestricted random sampling */
+                  samprate=1                /* same size as input */
+                  outhits                   /* expand multiplicity */
+                  reps=&N_BOOT.
+                  seed=&SEED.
+                  noprint;
+run;
+
+/* Pooled diff per replicate */
+proc sql;
+    create table work.boot_diffs as
+    select replicate,
+           mean(diff_rate) as boot_diff_rate,
+           mean(diff_disc) as boot_diff_disc,
+           mean(diff_cred) as boot_diff_cred,
+           mean(diff_cost) as boot_diff_cost
+    from work.boot_samples
+    group by replicate;
+quit;
+
+/* Compute 2.5 / 97.5 percentiles for each outcome */
+proc univariate data=work.boot_diffs noprint;
+    var boot_diff_rate boot_diff_disc boot_diff_cred boot_diff_cost;
+    output out=work.boot_ci
+           pctlpts  = 2.5 50 97.5
+           pctlpre  = rate_ disc_ cred_ cost_
+           pctlname = lo50 med hi95;
+run;
+
+/* Combine point estimates with bootstrap CIs into final pooled table */
+data work.pooled_diffs;
+    if _N_=1 then set work.point_estimates;
+    set work.boot_ci;
+    length outcome $30;
+    array pt {4} point_diff_rate point_diff_disc point_diff_cred point_diff_cost;
+    array lo {4} rate_lo50 disc_lo50 cred_lo50 cost_lo50;
+    array hi {4} rate_hi95 disc_hi95 cred_hi95 cost_hi95;
+    array nm {4} $30 _temporary_ ("Interest Rate (pp)"
+                                  "Discount Points ($)"
+                                  "Lender Credits ($)"
+                                  "Total Loan Costs ($)");
+    do i = 1 to 4;
+        outcome  = nm{i};
+        estimate = pt{i};
+        ci_lo    = lo{i};
+        ci_hi    = hi{i};
+        sig_95   = (ci_lo > 0) or (ci_hi < 0);
+        output;
+    end;
+    keep outcome estimate ci_lo ci_hi sig_95 n_tracts;
+run;
+
+proc print data=work.pooled_diffs noobs label;
+    title "Pooled pricing differentials with 95% cluster-bootstrap CIs";
+    title2 "ESL minus peer pool (3 CUs, equal-weighted), &N_BOOT bootstrap reps";
+    title3 "sig_95=1 means CI excludes zero";
+    label outcome  = "Outcome"
+          estimate = "Point estimate"
+          ci_lo    = "CI lower (2.5%)"
+          ci_hi    = "CI upper (97.5%)"
+          sig_95   = "Sig at 95%"
+          n_tracts = "N tracts";
+    format estimate ci_lo ci_hi 12.4;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  MODULE 5: RACE-STRATIFIED DECOMPOSITION
+  The fair lending payoff. Repeat Modules 2-4 separately for ESL borrowers
+  by race category. Peer pool stays the same (it's the benchmark).
+  Question: is ESL's pricing differential vs. peer pool LARGER for
+  Black/Hispanic borrowers than for white borrowers in the same tracts?
+
+  ASSUMES: variable `derived_race` exists with values like 'White',
+  'Black or African American', 'Hispanic', 'Asian'. ADJUST if your
+  race variable is named differently or coded as numeric.
+-----------------------------------------------------------------------------*/
+
+/* Macro to run the pooled-differential pipeline for one race subgroup */
+%macro race_diff(race_label=, race_filter=);
+
+    /* ESL means per tract, restricted to borrower race */
+    proc sql;
+        create table work.esl_means_&race_label as
+        select tract_key, count(*) as esl_n_race,
+               mean(Interest_Rate_Min_PMMS_1) as esl_rate,
+               mean(Discount_Points_LA)       as esl_disc,
+               mean(Lender_Credits_LA)        as esl_cred,
+               mean(Loan_Cost_Prc_LA)         as esl_cost
+        from work.analy_loans
+        where role = "ESL" and (&race_filter.)
+        group by tract_key
+        having calculated esl_n_race >= 1;
+    quit;
+
+    /* Tract differentials using SAME pooled peer benchmark */
+    proc sql;
+        create table work.cells_&race_label as
+        select e.tract_key,
+               e.esl_n_race,
+               e.esl_rate - p.pool_rate as diff_rate,
+               e.esl_disc - p.pool_disc as diff_disc,
+               e.esl_cred - p.pool_cred as diff_cred,
+               e.esl_cost - p.pool_cost as diff_cost
+        from work.esl_means_&race_label e
+        inner join work.pool_tract_means p
+          on e.tract_key = p.tract_key;
+    quit;
+
+    /* Bootstrap for this race subgroup */
+    proc surveyselect data=work.cells_&race_label
+                      out=work.boot_&race_label
+                      method=urs samprate=1 outhits
+                      reps=&N_BOOT. seed=&SEED. noprint;
+    run;
+
+    proc sql;
+        create table work.bootres_&race_label as
+        select replicate,
+               mean(diff_rate) as boot_diff_rate,
+               mean(diff_disc) as boot_diff_disc,
+               mean(diff_cred) as boot_diff_cred,
+               mean(diff_cost) as boot_diff_cost
+        from work.boot_&race_label
+        group by replicate;
+    quit;
+
+    proc univariate data=work.bootres_&race_label noprint;
+        var boot_diff_rate boot_diff_disc boot_diff_cred boot_diff_cost;
+        output out=work.ci_&race_label
+               pctlpts=2.5 97.5
+               pctlpre=rate_ disc_ cred_ cost_
+               pctlname=lo hi;
+    run;
+
+    proc sql;
+        create table work.pt_&race_label as
+        select count(*)        as n_tracts,
+               mean(diff_rate) as point_diff_rate,
+               mean(diff_disc) as point_diff_disc,
+               mean(diff_cred) as point_diff_cred,
+               mean(diff_cost) as point_diff_cost
+        from work.cells_&race_label;
+    quit;
+
+    /* Stack into one row per outcome with race label */
+    data work.race_summary_&race_label;
+        if _N_=1 then set work.pt_&race_label;
+        set work.ci_&race_label;
+        length race $30 outcome $30;
+        race = "&race_label";
+        array pt {4} point_diff_rate point_diff_disc point_diff_cred point_diff_cost;
+        array lo {4} rate_lo disc_lo cred_lo cost_lo;
+        array hi {4} rate_hi disc_hi cred_hi cost_hi;
+        array nm {4} $30 _temporary_ ("Rate (pp)" "Discount Points ($)"
+                                      "Lender Credits ($)" "Loan Costs ($)");
+        do i = 1 to 4;
+            outcome  = nm{i};
+            estimate = pt{i};
+            ci_lo    = lo{i};
+            ci_hi    = hi{i};
+            sig_95   = (ci_lo > 0) or (ci_hi < 0);
+            output;
+        end;
+        keep race outcome estimate ci_lo ci_hi sig_95 n_tracts;
+    run;
+
+%mend;
+
+/* Run for each race subgroup. ADJUST race_filter to your variable name/coding. */
+%race_diff(race_label=White,
+           race_filter=%str(derived_race in ("White","5")));
+%race_diff(race_label=Black,
+           race_filter=%str(derived_race in ("Black or African American","3")));
+%race_diff(race_label=Hispanic,
+           race_filter=%str(derived_ethnicity in ("Hispanic or Latino","1")));
+%race_diff(race_label=Asian,
+           race_filter=%str(derived_race in ("Asian","2")));
+
+/* Stack into single comparison table */
+data work.race_stratified_diffs;
+    set work.race_summary_White
+        work.race_summary_Black
+        work.race_summary_Hispanic
+        work.race_summary_Asian;
+run;
+
+proc print data=work.race_stratified_diffs noobs label;
+    title "Race-stratified pricing differentials";
+    title2 "ESL borrowers (by race) vs. pooled peer benchmark in same tracts";
+    title3 "Larger differential for non-white borrowers = potential fair lending concern";
+    label race=" " outcome=" " estimate="Estimate" ci_lo="CI lo" ci_hi="CI hi"
+          sig_95="Sig" n_tracts="N";
+    format estimate ci_lo ci_hi 10.4;
+    by race notsorted;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  MODULE 6: PER-PEER DIAGNOSTIC (where is the pooled diff coming from?)
+-----------------------------------------------------------------------------*/
+
+proc sql;
+    create table work.peer_diagnostics as
+    select pt.join_number,
+           count(distinct pt.tract_key)   as n_shared_w_esl,
+           sum(pt.peer_n)                 as total_peer_loans_in_shared,
+           mean(em.esl_rate - pt.peer_rate) as avg_diff_rate,
+           mean(em.esl_disc - pt.peer_disc) as avg_diff_disc,
+           mean(em.esl_cred - pt.peer_cred) as avg_diff_cred,
+           mean(em.esl_cost - pt.peer_cost) as avg_diff_cost
+    from work.peer_tract_means pt
+    inner join work.esl_tract_means em
+      on pt.tract_key = em.tract_key
+    group by pt.join_number;
+quit;
+
+proc print data=work.peer_diagnostics noobs label;
+    title "Per-peer breakdown: ESL minus EACH peer (diagnostic)";
+    title2 "Shows where the pooled differential is coming from";
+    format avg_diff_rate 8.4
+           avg_diff_disc avg_diff_cred avg_diff_cost dollar10.2;
+run;
 title;
 
 /*=============================================================================
   END
-  Decision point: examine regime_comparison and regime_peer_overlap. Pick the
-  regime whose peer set is large enough for SUR (~10+) but tight enough that
-  the median peer is geographically meaningful (overlap >= ~5%).
+  Headline output: work.pooled_diffs
+  Fair-lending output: work.race_stratified_diffs
+  Diagnostic: work.peer_diagnostics
 =============================================================================*/
