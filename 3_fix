@@ -1,19 +1,19 @@
-/* Find all fee/cost components in the dataset */
+/* Diagnostic: full peer_scored distribution before threshold filtering */
+proc univariate data=work.peer_scored;
+    var overlap_score n_shared_tracts peer_total_origs peer_concentration;
+run;
+
+proc print data=work.peer_scored (obs=30);
+    title "Top 30 peers by overlap_score - pre-threshold";
+    var join_number overlap_score n_shared_tracts peer_total_origs peer_concentration;
+run;
+
+/* And: how many CUs were even in the candidate pool? */
 proc sql;
-  select name, label, type, length
-  from dictionary.columns
-  where libname='HMDA24'
-    and memname='ESLFCU'
-    and (lowcase(name) contains 'fee'
-      or lowcase(name) contains 'cost'
-      or lowcase(name) contains 'charge'
-      or lowcase(name) contains 'origination'
-      or lowcase(name) contains 'closing'
-      or lowcase(name) contains 'total_loan'
-      or lowcase(name) contains 'underwrit'
-      or lowcase(label) contains 'fee'
-      or lowcase(label) contains 'cost'
-      or lowcase(label) contains 'charge'
-      or lowcase(label) contains 'origination')
-  order by name;
+    select count(*) as n_eligible_cus from work.cu_eligible;
 quit;
+
+/* What's the geographic distribution of ESL's volume? */
+proc print data=work.esl_tract_dist (obs=20);
+    title "ESL top 20 tracts by volume";
+run;
