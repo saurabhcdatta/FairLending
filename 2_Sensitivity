@@ -1,0 +1,267 @@
+/*=============================================================================
+  PROGRAM:    esl_peer_sensitivity_analysis.sas
+  PURPOSE:    Sensitivity analysis across 3 parameter regimes for ESL peer
+              selection. Reuses Modules 1-2 outputs from the main framework
+              (work.esl_tract_dist, work.cu_origs, work.esl_origs). Re-runs
+              Modules 2b-4 under each regime and produces side-by-side
+              comparison plus separate output datasets.
+
+  PRECONDITION: esl_geographic_peer_framework.sas Modules 0-2 have run, so
+                work.esl_origs, work.cu_origs, work.esl_tract_dist exist
+                in the WORK library.
+
+  REGIMES:
+    A - Aggressive: floor=50,  vol_tr=1, overlap>=0.02
+    B - Moderate:   floor=100, vol_tr=1, overlap>=0.03
+    C - Strict:     floor=250, vol_tr=1, overlap>=0.05
+
+  OUTPUTS:
+    work.peers_regime_A, work.peers_regime_B, work.peers_regime_C
+    work.regime_comparison           - one-row-per-regime summary
+    work.regime_peer_overlap         - which peers appear in which regimes
+=============================================================================*/
+
+options nofmterr mprint=0 mlogic=0 symbolgen=0;
+
+/* Pull ESL totals into macros if not already set in environment */
+proc sql noprint;
+    select sum(loan_amount) into :esl_total_vol trimmed
+    from work.esl_origs;
+    select count(distinct tract_key) into :esl_n_tracts trimmed
+    from work.esl_origs;
+quit;
+
+%put NOTE: ESL total volume = &esl_total_vol, distinct tracts = &esl_n_tracts;
+
+/*-----------------------------------------------------------------------------
+  REUSABLE MACRO: run_regime
+  Encapsulates eligibility filter, overlap scoring, and selection for one
+  parameter set.
+-----------------------------------------------------------------------------*/
+%macro run_regime(regime=, floor=, vol_tr=, overlap=, top_n=25);
+
+    %put ==========================================================;
+    %put RUNNING REGIME &regime: floor=&floor, vol_tr=&vol_tr, overlap=&overlap;
+    %put ==========================================================;
+
+    /* Eligibility (activity floor) */
+    proc sql;
+        create table work.elig_&regime as
+        select join_number,
+               count(*)         as peer_total_origs,
+               sum(loan_amount) as peer_total_vol
+        from work.cu_origs
+        group by join_number
+        having calculated peer_total_origs >= &floor.;
+    quit;
+
+    proc sql noprint;
+        select count(*) into :n_elig_&regime trimmed from work.elig_&regime;
+    quit;
+
+    /* Restrict candidate origs to eligible CUs */
+    proc sql;
+        create table work.cand_&regime as
+        select a.*
+        from work.cu_origs a
+        inner join work.elig_&regime b
+          on a.join_number = b.join_number;
+    quit;
+
+    /* Peer presence per tract with vol_tr floor */
+    proc sql;
+        create table work.pres_&regime as
+        select join_number,
+               tract_key,
+               count(*)         as peer_n_loans,
+               sum(loan_amount) as peer_vol_tract
+        from work.cand_&regime
+        group by join_number, tract_key
+        having calculated peer_n_loans >= &vol_tr.;
+    quit;
+
+    /* Compute overlap (ESL volume covered by shared tracts) */
+    proc sql;
+        create table work.raw_&regime as
+        select p.join_number,
+               count(distinct p.tract_key)            as n_shared_tracts,
+               sum(e.esl_vol)                         as esl_vol_covered,
+               sum(p.peer_vol_tract)                  as peer_vol_in_shared,
+               sum(p.peer_n_loans)                    as peer_n_in_shared
+        from work.pres_&regime p
+        inner join work.esl_tract_dist e
+          on p.tract_key = e.tract_key
+        group by p.join_number;
+    quit;
+
+    proc sql;
+        create table work.scored_&regime as
+        select r.join_number,
+               r.n_shared_tracts,
+               r.esl_vol_covered,
+               r.esl_vol_covered / &esl_total_vol.      as overlap_score
+                                                          format=percent8.2,
+               r.peer_n_in_shared,
+               r.peer_vol_in_shared,
+               e.peer_total_origs,
+               e.peer_total_vol,
+               r.peer_n_in_shared / e.peer_total_origs  as peer_concentration
+                                                          format=percent8.2
+        from work.raw_&regime r
+        inner join work.elig_&regime e
+          on r.join_number = e.join_number
+        order by overlap_score desc;
+    quit;
+
+    /* Apply overlap threshold + top-N */
+    data work.peers_regime_&regime;
+        length regime $1;
+        retain regime "&regime";
+        set work.scored_&regime;
+        where overlap_score >= &overlap.;
+        rank_overlap = _N_;
+        if rank_overlap <= &top_n.;
+    run;
+
+    /* Capture diagnostics */
+    proc sql noprint;
+        select count(*),
+               sum(case when overlap_score >= &overlap. then 1 else 0 end),
+               max(overlap_score),
+               median(overlap_score)
+        into :n_scored_&regime  trimmed,
+             :n_passed_&regime  trimmed,
+             :max_score_&regime trimmed,
+             :med_score_&regime trimmed
+        from work.scored_&regime;
+    quit;
+
+    proc sql noprint;
+        select count(*) into :n_final_&regime trimmed
+        from work.peers_regime_&regime;
+    quit;
+
+%mend run_regime;
+
+/*-----------------------------------------------------------------------------
+  EXECUTE THE THREE REGIMES
+-----------------------------------------------------------------------------*/
+%run_regime(regime=A, floor=50,  vol_tr=1, overlap=0.02, top_n=25);
+%run_regime(regime=B, floor=100, vol_tr=1, overlap=0.03, top_n=25);
+%run_regime(regime=C, floor=250, vol_tr=1, overlap=0.05, top_n=25);
+
+/*-----------------------------------------------------------------------------
+  SIDE-BY-SIDE COMPARISON TABLE
+-----------------------------------------------------------------------------*/
+data work.regime_comparison;
+    length regime $1 description $40;
+    format max_overlap median_overlap percent8.2;
+
+    regime = "A"; description = "Aggressive (floor=50, overlap>=2%)";
+    n_eligible_cus    = &n_elig_A.;
+    n_with_any_overlap = &n_scored_A.;
+    n_passed_threshold = &n_passed_A.;
+    n_final_top_n      = &n_final_A.;
+    max_overlap        = &max_score_A.;
+    median_overlap     = &med_score_A.;
+    output;
+
+    regime = "B"; description = "Moderate (floor=100, overlap>=3%)";
+    n_eligible_cus    = &n_elig_B.;
+    n_with_any_overlap = &n_scored_B.;
+    n_passed_threshold = &n_passed_B.;
+    n_final_top_n      = &n_final_B.;
+    max_overlap        = &max_score_B.;
+    median_overlap     = &med_score_B.;
+    output;
+
+    regime = "C"; description = "Strict (floor=250, overlap>=5%)";
+    n_eligible_cus    = &n_elig_C.;
+    n_with_any_overlap = &n_scored_C.;
+    n_passed_threshold = &n_passed_C.;
+    n_final_top_n      = &n_final_C.;
+    max_overlap        = &max_score_C.;
+    median_overlap     = &med_score_C.;
+    output;
+
+    label
+        n_eligible_cus     = "Eligible CUs (pass floor)"
+        n_with_any_overlap = "CUs with any tract overlap"
+        n_passed_threshold = "CUs >= overlap threshold"
+        n_final_top_n      = "Final peer count (post top-N)"
+        max_overlap        = "Max overlap score"
+        median_overlap     = "Median overlap score";
+run;
+
+proc print data=work.regime_comparison noobs label;
+    title "Sensitivity Analysis: Peer Selection Across 3 Regimes";
+    title2 "ESL FCU (join_number=26241), 2024 HMDA, CU-only universe";
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  PEER OVERLAP ACROSS REGIMES
+  Which peer CUs appear in which regimes? Identifies the stable core peer
+  set vs. peers that only appear under aggressive parameters.
+-----------------------------------------------------------------------------*/
+proc sql;
+    create table work.regime_peer_overlap as
+    select coalesce(a.join_number, b.join_number, c.join_number) as join_number,
+           case when a.join_number is not null then 1 else 0 end as in_A,
+           case when b.join_number is not null then 1 else 0 end as in_B,
+           case when c.join_number is not null then 1 else 0 end as in_C,
+           coalesce(a.overlap_score, b.overlap_score, c.overlap_score)
+                                                                 as best_overlap
+                                                                 format=percent8.2,
+           coalesce(a.peer_total_origs, b.peer_total_origs, c.peer_total_origs)
+                                                                 as peer_total_origs,
+           coalesce(a.n_shared_tracts, b.n_shared_tracts, c.n_shared_tracts)
+                                                                 as n_shared_tracts
+    from work.peers_regime_A a
+    full join work.peers_regime_B b on a.join_number = b.join_number
+    full join work.peers_regime_C c on coalesce(a.join_number, b.join_number)
+                                       = c.join_number
+    order by in_C desc, in_B desc, in_A desc, best_overlap desc;
+quit;
+
+proc print data=work.regime_peer_overlap noobs label;
+    title "Peer membership across regimes (1=member)";
+    title2 "Read: peers in regime C are most stable; peers only in A are most marginal";
+    var join_number in_A in_B in_C best_overlap n_shared_tracts peer_total_origs;
+run;
+title;
+
+/* Quick stability check: how many peers are in all 3? Only in A? */
+proc sql;
+    title "Stability summary";
+    select sum(in_A and in_B and in_C) as in_all_three,
+           sum(in_C)                   as in_C_only_or_more,
+           sum(in_A and not in_B)      as in_A_not_B,
+           sum(in_B and not in_C)      as in_B_not_C
+    from work.regime_peer_overlap;
+quit;
+title;
+
+/*-----------------------------------------------------------------------------
+  TOP-10 LISTS PER REGIME (for visual inspection of who the peers are)
+-----------------------------------------------------------------------------*/
+%macro top10(regime);
+    proc print data=work.peers_regime_&regime (obs=10) noobs label;
+        title "Regime &regime: Top 10 peers by overlap score";
+        var rank_overlap join_number overlap_score n_shared_tracts
+            peer_total_origs peer_concentration;
+        format peer_total_origs comma10.;
+    run;
+%mend;
+
+%top10(A);
+%top10(B);
+%top10(C);
+title;
+
+/*=============================================================================
+  END
+  Decision point: examine regime_comparison and regime_peer_overlap. Pick the
+  regime whose peer set is large enough for SUR (~10+) but tight enough that
+  the median peer is geographically meaningful (overlap >= ~5%).
+=============================================================================*/
