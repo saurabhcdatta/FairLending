@@ -1,0 +1,502 @@
+/* ============================================================
+   *** 2025 REPLICATION - PRE-RUN VERIFICATION CHECKLIST ***
+
+   This is the 2024 PSM/IPW script with path/year substitutions
+   only (2024_NEW->2025_NEW, hmda24->hmda25). The substantive
+   methodology, variable list, and outcome definitions are
+   unchanged from 2024.
+
+   BEFORE RUNNING, VERIFY:
+
+   1. The dataset hmda25.eslfcu exists. This is DIFFERENT from
+      reg_combinations_origs6 used in the Oaxaca/mixed-effects
+      scripts. It is presumably built upstream from the same
+      raw HMDA but pre-filtered to ESL and pre-binned. If the
+      2025 build pipeline did not produce hmda25.eslfcu, this
+      script cannot run as-is.
+
+   2. The following variables exist in hmda25.eslfcu with the
+      same definitions as in 2024:
+
+      Race flags:  black white hisp asian (binary 0/1)
+      Outcomes:    numeric_rate Discount_Points_LA
+                   Lender_Credits_LA Loan_Cost_Prc_LA
+      Weight:      loan_Amt
+      LTV bands:   LTV_2a LTV_3a LTV_4a LTV_5a LTV_6a
+      Credit:      CS_1a CS_2a CS_3a CS_4a CS_5a
+      Flags:       Broker Other_Lien Offers_Other_Types
+      Lender size: Lender_0_500 Lender_500_2000
+                   Lender_2000_5000 Lender_5000_10000
+      MSA dummies: M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11
+
+      Run this BEFORE the main code to verify:
+
+         proc contents data=hmda25.eslfcu out=work._chk
+            (keep=name) noprint; run;
+         proc print data=work._chk; run;
+
+      Compare against the same proc contents from
+      hmda24.eslfcu. Any missing variables or renamed
+      variables will need to be addressed before running.
+
+   3. The MSA dummies M1-M11 are referenced in 2024. In 2025
+      ESL's footprint may differ. If any M-dummy has zero
+      variation in 2025 ESL, PROC LOGISTIC or PROC PSMATCH may
+      drop it or error. If the M-coverage changed, the model
+      specification may need to be adjusted.
+
+   4. The numeric_rate variable here is the raw interest rate,
+      not Interest_Rate_Min_PMMS_1 (the rate spread used in the
+      Oaxaca and mixed-effects scripts). PSM rate findings are
+      not directly comparable to those other methods.
+
+   5. The all_in_cost composite is constructed inside this
+      script from numeric_rate, Discount_Points_LA,
+      Lender_Credits_LA, and Loan_Cost_Prc_LA. No upstream
+      variable named all_in_cost needs to exist.
+
+   ============================================================
+   NOTE ON OUTPUT:
+   The Excel output goes to Fair_Lending_Multi_Outcome_2025.xlsx
+   in S:\Projects\OCFP_Fair_Lending\2025_NEW\data\.
+   The path needs to exist or PROC EXPORT will fail.
+   ============================================================ */
+
+/* ============================================================
+   FAIR LENDING PSM ANALYSIS - MULTI-GROUP, MULTI-OUTCOME
+   FIXED: Outcome variables removed from RHS controls
+   HMDA 2025 | Credit Union | White as Baseline
+   Groups:   Black, Hispanic, Asian
+   Outcomes: Rate, Points, Credits, Cost%, All-In Cost
+   Methods:  GLM (matched) + IPW Doubly-Robust
+   ============================================================ */
+
+%let path = S:\Projects\OCFP_Fair_Lending\2025_NEW\data;
+libname hmda25 "&path";
+
+/* ============================================================
+   STEP 1: CREATE DATASET WITH KEEP FLAGS + COMPOSITE COST
+   ============================================================ */
+
+data hmda_race;
+  set hmda25.eslfcu;
+
+  /* Keep flags for each comparison */
+  keep_bw = (black=1 or white=1);
+  keep_hw = (hisp=1  or white=1);
+  keep_aw = (asian=1 or white=1);
+
+  /* Composite "all-in cost" */
+  all_in_cost = (numeric_rate / 100)
+              + Discount_Points_LA
+              - Lender_Credits_LA
+              + Loan_Cost_Prc_LA;
+run;
+
+proc freq data=hmda_race;
+  tables black white hisp asian
+         keep_bw keep_hw keep_aw / missing;
+  title "Sample Counts by Race Group";
+run;
+
+proc means data=hmda_race n mean stddev min max;
+  var numeric_rate Discount_Points_LA Lender_Credits_LA
+      Loan_Cost_Prc_LA all_in_cost;
+  title "Pricing Variables - Distribution Check";
+run;
+
+/* ============================================================
+   STEP 2: PSM MACRO WITH MULTI-OUTCOME ANALYSIS
+   ============================================================ */
+
+%macro fair_lending_psm(
+  group   =,
+  label   =,
+  keepvar =
+);
+
+  title "=== FAIR LENDING: &label vs. White ===";
+
+  /* ----------------------------------------------------------
+     2A: SUBSET TO COMPARISON PAIR
+     ---------------------------------------------------------- */
+  data analysis_&group;
+    set hmda_race;
+    where &keepvar = 1;
+    treated = &group;
+  run;
+
+  proc freq data=analysis_&group;
+    tables treated / missing;
+    title "N: &label (1) vs White (0)";
+  run;
+
+  /* ----------------------------------------------------------
+     2B: PROPENSITY SCORE MODEL
+     ---------------------------------------------------------- */
+  ods graphics on;
+
+  proc logistic data=analysis_&group desc
+                plots(only)=(roc);
+    weight loan_Amt;
+    model treated =
+      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+      LTV_2a LTV_3a LTV_4a LTV_5a LTV_6a
+      CS_1a  CS_2a  CS_3a  CS_4a  CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500 Lender_500_2000
+      Lender_2000_5000 Lender_5000_10000
+      M1-M11
+      / lackfit;
+    output out = ps_&group p = pscore;
+    title "PS Model: &label vs White";
+  run;
+
+  ods graphics off;
+
+  /* ----------------------------------------------------------
+     2C: PSM MATCHING - 1:1 Optimal, caliper 0.25
+     ---------------------------------------------------------- */
+  ods graphics on;
+
+  proc psmatch data=ps_&group
+               region=allobs(psmin=0.05 psmax=0.95);
+    class treated
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11;
+    psmodel treated(Treated='1') =
+      Discount_Points_LA Lender_Credits_LA Loan_Cost_Prc_LA
+      LTV_2a--LTV_6a CS_1a--CS_5a
+      Broker Other_Lien Offers_Other_Types
+      Lender_0_500--Lender_5000_10000
+      M1-M11;
+    match method=optimal(k=1) caliper=0.25;
+    assess ps lps
+           var=(Discount_Points_LA Lender_Credits_LA
+                Loan_Cost_Prc_LA numeric_rate)
+           / plots=all weight=none;
+    output out      = matched_&group
+           matchid  = MatchID_
+           matchwgt = MatchWgt_;
+    title "PSM 1:1 Optimal | &label vs White";
+  run;
+
+  ods graphics off;
+
+  /* Recompute composite if PSMATCH dropped it */
+  data matched_&group;
+    set matched_&group;
+    if missing(all_in_cost) then
+      all_in_cost = (numeric_rate / 100)
+                  + Discount_Points_LA
+                  - Lender_Credits_LA
+                  + Loan_Cost_Prc_LA;
+  run;
+
+  /* ----------------------------------------------------------
+     2D: BALANCE
+     ---------------------------------------------------------- */
+  proc means data=matched_&group mean stddev;
+    class treated;
+    var Discount_Points_LA Lender_Credits_LA
+        Loan_Cost_Prc_LA numeric_rate all_in_cost pscore;
+    title "Post-Match Balance | &label vs White";
+  run;
+
+  /* ----------------------------------------------------------
+     2E: BUILD IPW DATASET
+     ---------------------------------------------------------- */
+  proc sql noprint;
+    select count(*) into :n_treated trimmed
+    from analysis_&group where treated=1;
+    select count(*) into :n_total trimmed
+    from analysis_&group;
+  quit;
+
+  data ps_ipw_&group;
+    set ps_&group;
+    if treated=1
+      then sipw = (&n_treated/&n_total) / pscore;
+    else  sipw = (1-(&n_treated/&n_total)) / (1-pscore);
+    if sipw > 10 then sipw = 10;
+    if missing(all_in_cost) then
+      all_in_cost = (numeric_rate / 100)
+                  + Discount_Points_LA
+                  - Lender_Credits_LA
+                  + Loan_Cost_Prc_LA;
+  run;
+
+  /* ----------------------------------------------------------
+     2F: LOOP OVER FIVE PRICING OUTCOMES
+     CRITICAL: Outcome variable is excluded from controls
+     ---------------------------------------------------------- */
+  %let outcomes = numeric_rate Discount_Points_LA
+                  Lender_Credits_LA Loan_Cost_Prc_LA
+                  all_in_cost;
+  %let i = 1;
+
+  %do %while (%scan(&outcomes, &i) ne );
+    %let var = %scan(&outcomes, &i);
+
+    /* Dynamic control list - exclude the outcome from RHS */
+    %let pricing_controls =;
+    %if &var ne Discount_Points_LA %then
+      %let pricing_controls = &pricing_controls Discount_Points_LA;
+    %if &var ne Lender_Credits_LA %then
+      %let pricing_controls = &pricing_controls Lender_Credits_LA;
+    %if &var ne Loan_Cost_Prc_LA %then
+      %let pricing_controls = &pricing_controls Loan_Cost_Prc_LA;
+    /* all_in_cost contains all components - drop them all */
+    %if &var = all_in_cost %then %let pricing_controls = ;
+
+    %put NOTE: Outcome=&var | Controls=&pricing_controls;
+
+    /* ---- GLM (matched, fully adjusted) ---- */
+    ods output ParameterEstimates = glm_parms_&group._&i;
+
+    proc glm data=matched_&group;
+      class treated
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        Broker Other_Lien Offers_Other_Types
+        Lender_0_500--Lender_5000_10000
+        M1-M11;
+      model &var =
+        treated
+        &pricing_controls
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        Broker Other_Lien Offers_Other_Types
+        Lender_0_500--Lender_5000_10000
+        M1-M11
+        / solution clparm;
+      title "Adjusted GLM | &label vs White | &var";
+    run;
+    quit;
+
+    data glm_result_&group._&i;
+      set glm_parms_&group._&i;
+      where Parameter contains 'treated' 
+        and Parameter ne ''
+        and Estimate ne 0;        /* Drop reference-level rows */
+      length group $12 method $15 outcome $25;
+      group   = "&label";
+      method  = "GLM_Adjusted";
+      outcome = "&var";
+      /* GLM with class treated codes 0 first;
+         flip sign so positive = minority higher */
+      rate_diff = -1 * Estimate;
+      std_err   = StdErr;
+      pvalue    = Probt;
+      lower_cl  = -1 * UpperCL;
+      upper_cl  = -1 * LowerCL;
+      keep group method outcome rate_diff std_err
+           pvalue lower_cl upper_cl;
+    run;
+
+    /* ---- IPW Doubly-Robust ---- */
+    ods output ParameterEstimates = ipw_parms_&group._&i;
+
+    proc genmod data=ps_ipw_&group;
+      class treated M1-M11
+            LTV_2a--LTV_6a CS_1a--CS_5a;
+      model &var =
+        treated
+        &pricing_controls
+        LTV_2a--LTV_6a CS_1a--CS_5a
+        M1-M11
+        / dist=normal link=identity;
+      weight sipw;
+      title "IPW Doubly-Robust | &label vs White | &var";
+    run;
+
+    data ipw_result_&group._&i;
+      set ipw_parms_&group._&i;
+      where Parameter contains 'treated' 
+        and Level1 = '1';
+      length group $12 method $15 outcome $25;
+      group   = "&label";
+      method  = "IPW_DR";
+      outcome = "&var";
+      rate_diff = Estimate;
+      std_err   = StdErr;
+      pvalue    = ProbChiSq;
+      lower_cl  = LowerWaldCL;
+      upper_cl  = UpperWaldCL;
+      keep group method outcome rate_diff std_err
+           pvalue lower_cl upper_cl;
+    run;
+
+    %let i = %eval(&i + 1);
+  %end;
+
+  /* ----------------------------------------------------------
+     2G: COMBINE RESULTS FOR THIS GROUP
+     ---------------------------------------------------------- */
+  data results_&group;
+    set glm_result_&group._1 glm_result_&group._2
+        glm_result_&group._3 glm_result_&group._4
+        glm_result_&group._5
+        ipw_result_&group._1 ipw_result_&group._2
+        ipw_result_&group._3 ipw_result_&group._4
+        ipw_result_&group._5;
+  run;
+
+%mend fair_lending_psm;
+
+/* ============================================================
+   STEP 3: RUN ALL THREE COMPARISONS
+   ============================================================ */
+
+%fair_lending_psm(group=black, label=Black,    keepvar=keep_bw);
+%fair_lending_psm(group=hisp,  label=Hispanic, keepvar=keep_hw);
+%fair_lending_psm(group=asian, label=Asian,    keepvar=keep_aw);
+
+/* ============================================================
+   STEP 4: BUILD COMBINED SUMMARY WITH DIRECTIONAL FLAGS
+   ============================================================ */
+
+data summary_all;
+  set results_black results_hisp results_asian;
+  length finding $30 direction_note $20;
+
+  /* For Lender_Credits, LOWER value = adverse;
+     For everything else, HIGHER value = adverse */
+  if outcome = 'Lender_Credits_LA' then do;
+    direction_note = "Lower=Adverse";
+    if pvalue ne . and pvalue < 0.05 and rate_diff < 0
+      then finding = "*** ADVERSE - SIGNIFICANT";
+    else if pvalue ne . and pvalue < 0.10 and rate_diff < 0
+      then finding = "** ADVERSE - MARGINAL";
+    else if rate_diff ne . and rate_diff > 0
+      then finding = "Favorable to minority";
+    else finding = "No significant disparity";
+  end;
+  else do;
+    direction_note = "Higher=Adverse";
+    if pvalue ne . and pvalue < 0.05 and rate_diff > 0
+      then finding = "*** ADVERSE - SIGNIFICANT";
+    else if pvalue ne . and pvalue < 0.10 and rate_diff > 0
+      then finding = "** ADVERSE - MARGINAL";
+    else if rate_diff ne . and rate_diff < 0
+      then finding = "Favorable to minority";
+    else finding = "No significant disparity";
+  end;
+
+  /* Economic magnitude on $300K loan */
+  if outcome in ('Discount_Points_LA' 'Lender_Credits_LA' 
+                 'Loan_Cost_Prc_LA' 'all_in_cost')
+    then dollar_impact_300k = rate_diff * 300000;
+  else if outcome = 'numeric_rate'
+    then dollar_impact_300k = rate_diff * 300000 / 100;
+run;
+
+proc sort data=summary_all;
+  by group outcome method;
+run;
+
+/* ============================================================
+   STEP 5: MASTER REPORT - FULL DETAIL
+   ============================================================ */
+
+proc print data=summary_all noobs label;
+  title "FAIR LENDING DISPARITY SUMMARY - ALL PRICING OUTCOMES";
+  title2 "2025 HMDA | GLM + IPW Doubly-Robust";
+  by group;
+  id group;
+  var outcome method rate_diff std_err lower_cl upper_cl
+      pvalue dollar_impact_300k direction_note finding;
+  format rate_diff std_err lower_cl upper_cl 12.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+  label outcome = "Outcome"
+        method  = "Method"
+        rate_diff = "Diff (minority-white)"
+        std_err = "Std Error"
+        lower_cl = "95% Lower"
+        upper_cl = "95% Upper"
+        pvalue = "P-Value"
+        dollar_impact_300k = "$ Impact on $300K Loan"
+        direction_note = "Direction"
+        finding = "Interpretation";
+run;
+
+/* ============================================================
+   STEP 6: FLAGGED ADVERSE FINDINGS
+   ============================================================ */
+
+proc print data=summary_all noobs label;
+  where finding contains 'ADVERSE';
+  title "FLAGGED ADVERSE FINDINGS - REQUIRES REVIEW";
+  var group outcome method rate_diff std_err pvalue
+      dollar_impact_300k finding;
+  format rate_diff std_err 12.6 pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* ============================================================
+   STEP 7: PIVOT VIEW - METHOD COMPARISON
+   ============================================================ */
+
+proc tabulate data=summary_all format=12.6;
+  class group outcome method;
+  var rate_diff pvalue;
+  table group='Group'*outcome='Outcome',
+        method=''*(rate_diff='Disparity'*sum=''
+                   pvalue='P-Val'*sum=''*f=6.4)
+        / box='Multi-Method Comparison';
+  title "PIVOT: GLM vs IPW Side-By-Side";
+run;
+
+/* ============================================================
+   STEP 8: EXPORT TO EXCEL
+   ============================================================ */
+
+ods excel file="&path\Fair_Lending_Multi_Outcome_2025.xlsx"
+          options(embedded_titles="yes");
+
+/* Sheet 1: Full detail */
+ods excel options(sheet_name="Full Detail");
+proc print data=summary_all noobs label;
+  title "Fair Lending Disparity Analysis - 2025 HMDA";
+  title2 "All Outcomes, All Groups, Both Methods";
+  var group outcome method rate_diff std_err
+      lower_cl upper_cl pvalue dollar_impact_300k 
+      direction_note finding;
+  format rate_diff std_err lower_cl upper_cl 12.6
+         pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* Sheet 2: Adverse findings only */
+ods excel options(sheet_name="Adverse Findings");
+proc print data=summary_all noobs label;
+  where finding contains 'ADVERSE';
+  title "Flagged Adverse Findings";
+  var group outcome method rate_diff std_err
+      pvalue dollar_impact_300k finding;
+  format rate_diff std_err 12.6 pvalue 6.4
+         dollar_impact_300k dollar10.2;
+run;
+
+/* Sheet 3: GLM only */
+ods excel options(sheet_name="GLM Results");
+proc print data=summary_all noobs label;
+  where method = 'GLM_Adjusted';
+  var group outcome rate_diff std_err lower_cl
+      upper_cl pvalue finding;
+  format rate_diff std_err lower_cl upper_cl 12.6
+         pvalue 6.4;
+run;
+
+/* Sheet 4: IPW only */
+ods excel options(sheet_name="IPW Doubly-Robust");
+proc print data=summary_all noobs label;
+  where method = 'IPW_DR';
+  var group outcome rate_diff std_err lower_cl
+      upper_cl pvalue finding;
+  format rate_diff std_err lower_cl upper_cl 12.6
+         pvalue 6.4;
+run;
+
+ods excel close;
