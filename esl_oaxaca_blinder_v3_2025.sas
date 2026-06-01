@@ -1,0 +1,374 @@
+/*=============================================================================
+  PROGRAM:    esl_oaxaca_blinder_v3.sas
+  PURPOSE:    Oaxaca-Blinder decomposition - v3 with proc append fix.
+              Runs end-to-end. No IML required.
+
+  FIX from v2: Removed empty data step initialization of base dataset.
+               Replaced with proc datasets delete (conditional). PROC APPEND
+               now creates the base from the first call with all columns.
+
+=============================================================================*/
+
+options nofmterr nomprint nomlogic nosymbolgen;
+
+libname hmda25 "S:\Projects\OCFP_Fair_Lending\2025_NEW\data";
+libname out    "S:\Projects\OCFP_Fair_Lending\2025_NEW\data\oaxaca";
+
+%let SOURCE_DS = hmda25.reg_combinations_origs6;
+%let ESL_ID    = 26241;
+
+/*-----------------------------------------------------------------------------
+  STEP 1: ANALYTICAL SAMPLE
+-----------------------------------------------------------------------------*/
+data work.esl_loans;
+    set &SOURCE_DS.;
+    where join_number = &ESL_ID.
+      and action = 1
+      and not missing(Interest_Rate_Min_PMMS_1)
+      and not missing(credit_score)
+      and not missing(DTI_N)
+      and not missing(LTV_COMBINED)
+      and not missing(loan_amount)
+      and not missing(LN_TERM)
+      and race in ("WHITE","BLACK","HISP")
+      and loan_type    in (1, 2)
+      and loan_purpose in (1, 32);
+
+    d_fha     = (loan_type = 2);
+    d_cashout = (loan_purpose = 32);
+    is_black  = (race = "BLACK");
+    is_hisp   = (race = "HISP");
+run;
+
+proc freq data=work.esl_loans;
+    title "Oaxaca analytical sample";
+    tables race / missing;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 2: REGRESSOR LISTS
+-----------------------------------------------------------------------------*/
+%let X_FULL = credit_score DTI_N LTV_COMBINED loan_amount LN_TERM d_fha d_cashout;
+%let X_NOLA = credit_score DTI_N LTV_COMBINED             LN_TERM d_fha d_cashout;
+
+/*-----------------------------------------------------------------------------
+  STEP 3: OAXACA MACRO (transpose-based, no array gymnastics)
+-----------------------------------------------------------------------------*/
+%macro oaxaca_one(
+    outcome=, outcome_label=,
+    ref_group=WHITE, prot_group=,
+    x_vars=,
+    spec_label=,
+    out_summary=
+);
+
+    %put ====================================================================;
+    %put OAXACA: &outcome, &prot_group vs &ref_group, spec=&spec_label;
+    %put ====================================================================;
+
+    data work._sample;
+        set work.esl_loans;
+        where race in ("&ref_group.","&prot_group.");
+        is_protected = (race = "&prot_group.");
+    run;
+
+    proc sql noprint;
+        select count(*) into :n_total trimmed from work._sample;
+        select count(*) into :n_ref   trimmed from work._sample where race="&ref_group.";
+        select count(*) into :n_prot  trimmed from work._sample where race="&prot_group.";
+    quit;
+
+    %if &n_prot < 10 %then %do;
+        %put WARNING: protected group n=&n_prot too small - skipping;
+        %return;
+    %end;
+
+    /* Three regressions */
+    proc reg data=work._sample(where=(race="&ref_group.")) noprint
+             outest=work._beta_ref_wide;
+        model &outcome. = &x_vars.;
+    run; quit;
+
+    proc reg data=work._sample(where=(race="&prot_group.")) noprint
+             outest=work._beta_prot_wide;
+        model &outcome. = &x_vars.;
+    run; quit;
+
+    proc reg data=work._sample noprint
+             outest=work._beta_pool_wide;
+        model &outcome. = &x_vars. is_protected;
+    run; quit;
+
+    /* Group means */
+    proc means data=work._sample(where=(race="&ref_group.")) noprint;
+        var &outcome. &x_vars.;
+        output out=work._mean_ref_wide(drop=_TYPE_ _FREQ_) mean=;
+    run;
+    proc means data=work._sample(where=(race="&prot_group.")) noprint;
+        var &outcome. &x_vars.;
+        output out=work._mean_prot_wide(drop=_TYPE_ _FREQ_) mean=;
+    run;
+
+    /* Transpose to long format */
+    proc transpose data=work._beta_ref_wide(keep=Intercept &x_vars.)
+                   out=work._beta_ref_long(rename=(_NAME_=variable COL1=beta_ref));
+    run;
+    proc transpose data=work._beta_prot_wide(keep=Intercept &x_vars.)
+                   out=work._beta_prot_long(rename=(_NAME_=variable COL1=beta_prot));
+    run;
+    proc transpose data=work._beta_pool_wide(keep=Intercept &x_vars. is_protected)
+                   out=work._beta_pool_long(rename=(_NAME_=variable COL1=beta_pool));
+    run;
+    proc transpose data=work._mean_ref_wide(keep=&x_vars.)
+                   out=work._mean_ref_long(rename=(_NAME_=variable COL1=xbar_ref));
+    run;
+    proc transpose data=work._mean_prot_wide(keep=&x_vars.)
+                   out=work._mean_prot_long(rename=(_NAME_=variable COL1=xbar_prot));
+    run;
+
+    proc sql noprint;
+        select &outcome. into :y_ref_mean trimmed from work._mean_ref_wide;
+        select &outcome. into :y_prot_mean trimmed from work._mean_prot_wide;
+        select beta_ref  into :int_ref  trimmed from work._beta_ref_long
+            where upcase(variable)="INTERCEPT";
+        select beta_prot into :int_prot trimmed from work._beta_prot_long
+            where upcase(variable)="INTERCEPT";
+        select beta_pool into :int_pool trimmed from work._beta_pool_long
+            where upcase(variable)="INTERCEPT";
+        select beta_pool into :race_premium trimmed from work._beta_pool_long
+            where upcase(variable)="IS_PROTECTED";
+    quit;
+
+    /* Merge betas and means by variable name */
+    proc sql;
+        create table work._merged as
+        select br.variable,
+               br.beta_ref,
+               bp.beta_prot,
+               bo.beta_pool,
+               mr.xbar_ref,
+               mp.xbar_prot
+        from work._beta_ref_long  br
+        inner join work._beta_prot_long bp on upcase(br.variable)=upcase(bp.variable)
+        inner join work._beta_pool_long bo on upcase(br.variable)=upcase(bo.variable)
+        inner join work._mean_ref_long  mr on upcase(br.variable)=upcase(mr.variable)
+        inner join work._mean_prot_long mp on upcase(br.variable)=upcase(mp.variable)
+        where upcase(br.variable) not in ("INTERCEPT","IS_PROTECTED");
+    quit;
+
+    data work._merged_decomp;
+        set work._merged;
+        contrib_explained   = (xbar_ref - xbar_prot) * beta_pool;
+        contrib_unexp_ref   = xbar_ref  * (beta_ref - beta_pool);
+        contrib_unexp_prot  = xbar_prot * (beta_pool - beta_prot);
+        contrib_unexplained = contrib_unexp_ref + contrib_unexp_prot;
+    run;
+
+    proc sql;
+        create table work._agg as
+        select sum(contrib_explained)  as explained,
+               sum(contrib_unexp_ref)  as unexp_ref,
+               sum(contrib_unexp_prot) as unexp_prot,
+               sum(contrib_unexplained) as unexplained_slopes
+        from work._merged_decomp;
+    quit;
+
+    data work._summary_row;
+        set work._agg;
+        length comparison $20 outcome $40 outcome_lbl $40 spec $20;
+        comparison  = "&prot_group._vs_&ref_group.";
+        outcome     = "&outcome.";
+        outcome_lbl = "&outcome_label.";
+        spec        = "&spec_label.";
+
+        y_ref  = &y_ref_mean.;
+        y_prot = &y_prot_mean.;
+        gap    = y_ref - y_prot;
+
+        int_ref_v  = &int_ref.;
+        int_prot_v = &int_prot.;
+        int_pool_v = &int_pool.;
+
+        unexp_intercept = (int_ref_v - int_pool_v) + (int_pool_v - int_prot_v);
+        unexplained = unexplained_slopes + unexp_intercept;
+
+        check_diff = gap - (explained + unexplained);
+
+        if abs(gap) > 1e-10 then do;
+            pct_explained   = explained   / gap;
+            pct_unexplained = unexplained / gap;
+        end;
+
+        race_dummy_coef = &race_premium.;
+        n_ref  = &n_ref.;
+        n_prot = &n_prot.;
+        n      = &n_total.;
+
+        keep comparison outcome outcome_lbl spec
+             y_ref y_prot gap explained unexplained
+             unexp_ref unexp_prot unexp_intercept
+             pct_explained pct_unexplained
+             check_diff race_dummy_coef n_ref n_prot n;
+    run;
+
+    proc append base=&out_summary. data=work._summary_row force; run;
+
+%mend oaxaca_one;
+
+/*-----------------------------------------------------------------------------
+  STEP 4: RUN ALL COMBINATIONS
+  *** FIX: Delete the base dataset if it exists; let PROC APPEND create
+      it from first call so it picks up all variables. ***
+-----------------------------------------------------------------------------*/
+proc datasets library=out nolist;
+    delete oaxaca_summary oaxaca_memo;
+quit;
+
+%macro run_all(outcome=, outcome_label=);
+    %oaxaca_one(outcome=&outcome., outcome_label=&outcome_label.,
+                ref_group=WHITE, prot_group=BLACK,
+                x_vars=&X_FULL., spec_label=Full,
+                out_summary=out.oaxaca_summary);
+    %oaxaca_one(outcome=&outcome., outcome_label=&outcome_label.,
+                ref_group=WHITE, prot_group=BLACK,
+                x_vars=&X_NOLA., spec_label=NoLoanAmt,
+                out_summary=out.oaxaca_summary);
+    %oaxaca_one(outcome=&outcome., outcome_label=&outcome_label.,
+                ref_group=WHITE, prot_group=HISP,
+                x_vars=&X_FULL., spec_label=Full,
+                out_summary=out.oaxaca_summary);
+    %oaxaca_one(outcome=&outcome., outcome_label=&outcome_label.,
+                ref_group=WHITE, prot_group=HISP,
+                x_vars=&X_NOLA., spec_label=NoLoanAmt,
+                out_summary=out.oaxaca_summary);
+%mend;
+
+%run_all(outcome=Interest_Rate_Min_PMMS_1, outcome_label=Rate spread above PMMS);
+%run_all(outcome=Discount_Points_LA,       outcome_label=Discount points (% of loan));
+%run_all(outcome=Lender_Credits_LA,        outcome_label=Lender credits (% of loan));
+%run_all(outcome=Loan_Cost_Prc_LA,         outcome_label=Total loan costs (% of loan));
+
+/*-----------------------------------------------------------------------------
+  STEP 5: SANITY CHECK
+-----------------------------------------------------------------------------*/
+proc means data=out.oaxaca_summary n mean min max maxdec=10;
+    title "Sanity check: check_diff should be ~0 across all rows";
+    var check_diff;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 6: MEMO TABLE
+-----------------------------------------------------------------------------*/
+proc sql noprint;
+    select mean(loan_amount) into :avg_loan trimmed from work.esl_loans;
+quit;
+
+data out.oaxaca_memo;
+    set out.oaxaca_summary;
+
+    disparity_gap         = -gap;
+    disparity_explained   = -explained;
+    disparity_unexplained = -unexplained;
+
+    if outcome = "Interest_Rate_Min_PMMS_1" then do;
+        bp_gap         = disparity_gap         * 100;
+        bp_explained   = disparity_explained   * 100;
+        bp_unexplained = disparity_unexplained * 100;
+        dollar_unexpl  = bp_unexplained * &avg_loan / 10000;
+        unit = "bp rate spread";
+    end;
+    else do;
+        bp_gap         = disparity_gap         * 10000;
+        bp_explained   = disparity_explained   * 10000;
+        bp_unexplained = disparity_unexplained * 10000;
+        dollar_unexpl  = disparity_unexplained * &avg_loan;
+        unit = "bp of loan amt";
+    end;
+
+    pct_unexpl_disp = abs(pct_unexplained);
+
+    keep comparison outcome_lbl spec
+         bp_gap bp_explained bp_unexplained
+         pct_unexpl_disp dollar_unexpl unit n_ref n_prot;
+run;
+
+proc print data=out.oaxaca_memo noobs label;
+    title "Oaxaca-Blinder Decomposition - MEMO READY";
+    title2 "Average ESL loan: $%sysfunc(putn(&avg_loan, dollar12.0))";
+    title3 "Sample: ESL conventional/FHA, owner-occupied, purchase/cash-out only";
+    title4 "Positive bp_unexplained = unexplained pricing disadvantage to protected group";
+    label comparison      = "Comparison"
+          outcome_lbl     = "Outcome"
+          spec            = "Spec"
+          bp_gap          = "Total gap (bp)"
+          bp_explained    = "Explained (bp)"
+          bp_unexplained  = "Unexplained (bp)"
+          pct_unexpl_disp = "% Unexpl"
+          dollar_unexpl   = "$ Unexpl"
+          unit            = "Unit"
+          n_ref           = "N White"
+          n_prot          = "N Prot";
+    format bp_gap bp_explained bp_unexplained 10.1
+           pct_unexpl_disp percent8.1
+           dollar_unexpl dollar12.2;
+    by comparison outcome_lbl notsorted;
+run;
+title;
+
+/*-----------------------------------------------------------------------------
+  STEP 7: HEADLINE LOG DUMP
+-----------------------------------------------------------------------------*/
+proc sql noprint;
+    select bp_unexplained, dollar_unexpl, pct_unexpl_disp, n_ref, n_prot
+        into :bw_cost_bp, :bw_cost_dol, :bw_cost_pct, :bw_nw, :bw_nb
+    from out.oaxaca_memo
+    where comparison="BLACK_vs_WHITE"
+      and outcome_lbl="Total loan costs (% of loan)" and spec="Full";
+
+    select bp_unexplained into :bw_cost_bp_nola
+    from out.oaxaca_memo
+    where comparison="BLACK_vs_WHITE"
+      and outcome_lbl="Total loan costs (% of loan)" and spec="NoLoanAmt";
+
+    select bp_unexplained, dollar_unexpl into :bw_rate_bp, :bw_rate_dol
+    from out.oaxaca_memo
+    where comparison="BLACK_vs_WHITE"
+      and outcome_lbl="Rate spread above PMMS" and spec="Full";
+
+    select bp_unexplained, dollar_unexpl, n_prot
+        into :hw_cost_bp, :hw_cost_dol, :hw_nh
+    from out.oaxaca_memo
+    where comparison="HISP_vs_WHITE"
+      and outcome_lbl="Total loan costs (% of loan)" and spec="Full";
+
+    select bp_unexplained into :hw_rate_bp
+    from out.oaxaca_memo
+    where comparison="HISP_vs_WHITE"
+      and outcome_lbl="Rate spread above PMMS" and spec="Full";
+quit;
+
+%put ;
+%put ====================================================================;
+%put OAXACA-BLINDER HEADLINE FINDINGS;
+%put ====================================================================;
+%put ;
+%put BLACK vs WHITE (n White=&bw_nw, n Black=&bw_nb):;
+%put   Total loan costs - unexpl: &bw_cost_bp bp ($%sysfunc(round(&bw_cost_dol)));
+%put   Total loan costs - NoLoanAmt: &bw_cost_bp_nola bp;
+%put   Rate spread - unexpl: &bw_rate_bp bp ($%sysfunc(round(&bw_rate_dol))/yr);
+%put   Pct cost gap unexplained: &bw_cost_pct;
+%put ;
+%put HISPANIC vs WHITE (n Hispanic=&hw_nh):;
+%put   Total loan costs - unexpl: &hw_cost_bp bp ($%sysfunc(round(&hw_cost_dol)));
+%put   Rate spread - unexpl: &hw_rate_bp bp;
+%put ;
+%put TRIANGULATION CHECK:;
+%put   Geographic Black-White cost gap: ~137 bp ($2540);
+%put   Oaxaca   Black-White cost unexpl: &bw_cost_bp bp;
+%put ====================================================================;
+
+/*=============================================================================
+  END
+=============================================================================*/
