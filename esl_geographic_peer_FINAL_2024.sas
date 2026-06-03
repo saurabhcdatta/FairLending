@@ -57,10 +57,10 @@ libname out    "S:\Projects\OCFP_Fair_Lending\2024_NEW\data\peer_geo";
 data work.esl_origs;
     set &SOURCE_DS.;
     where join_number = &ESL_ID.
-      and action_taken = 1
-      and not missing(census_tract);
+      and action = 1
+      and not missing(property_census_tract);
     length tract_key $11;
-    tract_key = put(input(census_tract, ?? best12.), z11.);
+    tract_key = put(input(property_census_tract, ?? best12.), z11.);
     if tract_key in ('00000000000','.') then delete;
 run;
 
@@ -80,17 +80,17 @@ quit;
 
 /*-----------------------------------------------------------------------------
   STEP 2: ELIGIBLE CU CANDIDATE POOL
-  ADJUST 'institution_type in ("CU","Credit Union")' to match your CU flag.
+  Note: institution_type filter not needed - all loans in this dataset
+  are already from the relevant institution universe.
 -----------------------------------------------------------------------------*/
 data work.cu_origs;
     set &SOURCE_DS.;
-    where action_taken = 1
+    where action = 1
       and join_number ne &ESL_ID.
-      and not missing(census_tract)
-      and not missing(join_number)
-      and institution_type in ("CU","Credit Union");   /* <-- VERIFY VAR/VALUES */
+      and not missing(property_census_tract)
+      and not missing(join_number);
     length tract_key $11;
-    tract_key = put(input(census_tract, ?? best12.), z11.);
+    tract_key = put(input(property_census_tract, ?? best12.), z11.);
     if tract_key in ('00000000000','.') then delete;
 run;
 
