@@ -1,0 +1,19 @@
+/* Diagnostic 1: Look for any numeric variable that contains "orig" or "charg",
+   AND show all variables whose names end in _LA, _Prc_LA, or _n
+   (these are the conventions for processed/scaled versions in the PSM data) */
+proc sql;
+  select name, type, length, label
+  from dictionary.columns
+  where libname='HMDA25'
+    and memname='ESLFCU'
+    and (type='num' and (upcase(name) contains 'ORIG' 
+                         or upcase(name) contains 'CHARG'
+                         or upcase(name) contains 'FEE'))
+  order by name;
+quit;
+
+/* Diagnostic 2: Sample the values of the three character variables so we know
+   what we're dealing with - are they numbers stored as text, or text codes? */
+proc print data=hmda25.eslfcu(obs=10);
+  var orig_charges origination_charge tot_points_fees Loan_Cost_Prc_LA loan_Amt;
+run;
